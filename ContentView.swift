@@ -407,19 +407,21 @@ struct ContentView: View {
         if !prefetchDates.contains(where: { Int($0.timeIntervalSince1970 / 3600) == selectedHourStamp }) {
             prefetchDates.append(selectedDate)
         }
-        // Phase 1: first warm the currently selected hour under the user.
+        // Phase 1: first warm the currently selected hour in the visible viewport.
         prefetchHour(
             selectedDate,
             snapshot: snapshot,
             requestedZooms: [snapshot.zoom],
-            renderedTileBudget: 8,
-            visibleTileLimit: 48,
-            sourceTileLimit: 10,
+            renderedTileBudget: 14,
+            visibleTileLimit: min(72, max(24, snapshot.tiles.count)),
+            sourceTileLimit: 14,
             fetchIfMissing: true,
-            applyIfLatest: true
+            applyIfLatest: true,
+            probeSignalNearUser: true
         )
 
-        // Phase 2: then (with delay) warm nearby hours in background.
+        // Phase 2: then warm the same viewport for neighboring hours.
+        // Keep background work cheap: mostly source tiles, minimal rendered tiles.
         let backgroundDates = prefetchDates.filter {
             Int($0.timeIntervalSince1970 / 3600) != selectedHourStamp
         }
@@ -427,22 +429,41 @@ struct ContentView: View {
             for targetDate in backgroundDates {
                 let hourStamp = Int(targetDate.timeIntervalSince1970 / 3600)
                 let distance = abs(hourStamp - selectedHourStamp)
-                guard distance <= 2 else { continue }
+                guard distance > 0 else { continue }
+
+                let renderedBudget: Int
+                let visibleLimit: Int
+                let sourceLimit: Int
+
+                if distance <= 1 {
+                    renderedBudget = 4
+                    visibleLimit = min(34, max(12, snapshot.tiles.count / 2))
+                    sourceLimit = 9
+                } else if distance <= 3 {
+                    renderedBudget = 2
+                    visibleLimit = min(22, max(10, snapshot.tiles.count / 3))
+                    sourceLimit = 7
+                } else {
+                    renderedBudget = 0
+                    visibleLimit = min(14, max(8, snapshot.tiles.count / 4))
+                    sourceLimit = 5
+                }
 
                 prefetchHour(
                     targetDate,
                     snapshot: snapshot,
                     requestedZooms: [snapshot.zoom],
-                    renderedTileBudget: distance <= 1 ? 4 : 2,
-                    visibleTileLimit: distance <= 1 ? 24 : 12,
-                    sourceTileLimit: distance <= 1 ? 6 : 4,
-                    fetchIfMissing: distance <= 1,
-                    applyIfLatest: false
+                    renderedTileBudget: renderedBudget,
+                    visibleTileLimit: visibleLimit,
+                    sourceTileLimit: sourceLimit,
+                    fetchIfMissing: true,
+                    applyIfLatest: false,
+                    probeSignalNearUser: false
                 )
             }
         }
         forecastBackgroundPrefetchWorkItem = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.22, execute: work)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.16, execute: work)
     }
 
     private func prefetchHour(
@@ -453,7 +474,8 @@ struct ContentView: View {
         visibleTileLimit: Int,
         sourceTileLimit: Int,
         fetchIfMissing: Bool,
-        applyIfLatest: Bool
+        applyIfLatest: Bool,
+        probeSignalNearUser: Bool
     ) {
         let hourStamp = Int(targetDate.timeIntervalSince1970 / 3600)
 
@@ -476,7 +498,8 @@ struct ContentView: View {
 
         CloudOverlayService.fetchForecastFrame(
             targetDate: targetDate,
-            near: locationManager.location?.coordinate
+            near: locationManager.location?.coordinate,
+            probeSignalNearUser: probeSignalNearUser
         ) { result in
             forecastFrameRequestsInFlight.remove(hourStamp)
             guard case .success(let frame) = result else { return }
@@ -552,7 +575,9 @@ struct ContentView: View {
 
             let perZoomBudget = (requestedZoom == snapshot.zoom)
                 ? renderedTileBudget
-                : max(4, renderedTileBudget / 2)
+                : (renderedTileBudget > 0 ? max(2, renderedTileBudget / 2) : 0)
+
+            guard perZoomBudget > 0 else { continue }
 
             for tile in visibleTiles.prefix(perZoomBudget) {
                 UIKitMap.ForecastTileOverlay.prewarmRenderedTile(

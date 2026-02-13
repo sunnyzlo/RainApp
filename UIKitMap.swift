@@ -313,13 +313,16 @@ struct UIKitMap: UIViewRepresentable {
                 minSourceZ: minZoom,
                 maxSourceZ: maxZoom
             ) {
-                coordinator.pendingForecastMotion = .zero
-                coordinator.stopForecastFade()
+                let motion = coordinator.estimateForecastMotion(
+                    on: map,
+                    fromTemplate: fromTemplate,
+                    toTemplate: template
+                )
+                coordinator.pendingForecastMotion = motion
                 coordinator.clearPendingForecastOverlay(on: map)
-                coordinator.forecastRenderer?.alpha = coordinator.currentForecastTargetAlpha
                 coordinator.forecastRenderer?.toneDarkening = coordinator.currentForecastToneDarkening
-                coordinator.forecastRenderer?.transitionOffset = .zero
                 coordinator.forecastRenderer?.reloadData()
+                coordinator.animateForecastTemplateSwitch(using: motion)
                 print("☁️ Forecast tiles UPDATE (reuse overlay frame):", key)
             } else {
                 print("☁️DBG forecast overlay frame update called, but source unchanged")
@@ -786,7 +789,7 @@ struct UIKitMap: UIViewRepresentable {
         }()
         private static let networkSession: URLSession = {
             let config = URLSessionConfiguration.default
-            config.httpMaximumConnectionsPerHost = 3
+            config.httpMaximumConnectionsPerHost = 6
             config.timeoutIntervalForRequest = 8
             config.timeoutIntervalForResource = 12
             config.waitsForConnectivity = false
@@ -899,23 +902,13 @@ struct UIKitMap: UIViewRepresentable {
             y: Int
         ) {
             guard let url = makeURLStatic(template: template, z: z, x: x, y: y) else { return }
-            let cacheKey = url.absoluteString as NSString
-            if sourceTileCache.object(forKey: cacheKey) != nil { return }
-
-            var request = URLRequest(url: url)
-            request.timeoutInterval = 7
-            request.setValue(userAgent, forHTTPHeaderField: "User-Agent")
-            request.setValue("image/png,image/*;q=0.9,*/*;q=0.5", forHTTPHeaderField: "Accept")
-
-            networkSession.dataTask(with: request) { data, response, _ in
-                let statusCode = (response as? HTTPURLResponse)?.statusCode ?? -1
-                guard statusCode == 200, let data, !data.isEmpty else { return }
-                sourceTileCache.setObject(
-                    data as NSData,
-                    forKey: cacheKey,
-                    cost: data.count
-                )
-            }.resume()
+            fetchSourceTile(
+                url: url,
+                timeout: 7,
+                z: z,
+                x: x,
+                y: y
+            ) { _, _, _ in }
         }
 
         static func hasSourceCoverage(
@@ -1083,11 +1076,13 @@ struct UIKitMap: UIViewRepresentable {
                     "fallback=\(source.fallbackTemplate.map(Self.templateDebugToken) ?? "nil")"
                 )
             }
-            loadTileDirect(
+            loadTileForSourceZ(
                 requested: tilePath,
                 sourceZ: sourceZ,
+                minSourceZ: source.minSourceZ,
                 template: source.template,
                 fallbackTemplate: source.fallbackTemplate,
+                retriesLeft: 1,
                 result: result
             )
         }
@@ -1374,23 +1369,43 @@ struct UIKitMap: UIViewRepresentable {
             {
                 let immediateRendered: RenderedTile?
                 if sourceZ == requested.z {
-                    immediateRendered = Self.maskAndEncodeForecastTile(
-                        image: previousImage,
-                        targetSize: CGSize(
-                            width: previousImage.width,
-                            height: previousImage.height
-                        ),
-                        interpolation: .none,
-                        edgeSmoothingPasses: 0,
-                        tileEdgeFeatherWidth: 0
-                    )
+                    if Self.useRawRendering {
+                        immediateRendered = Self.renderRawTile(
+                            image: previousImage,
+                            targetSize: CGSize(
+                                width: previousImage.width,
+                                height: previousImage.height
+                            ),
+                            interpolation: .none
+                        )
+                    } else {
+                        immediateRendered = Self.maskAndEncodeForecastTile(
+                            image: previousImage,
+                            targetSize: CGSize(
+                                width: previousImage.width,
+                                height: previousImage.height
+                            ),
+                            interpolation: .none,
+                            edgeSmoothingPasses: 0,
+                            tileEdgeFeatherWidth: 0
+                        )
+                    }
                 } else {
-                    immediateRendered = Self.cropAndScale(
-                        sourceImage: previousImage,
-                        requested: requested,
-                        sourceZ: sourceZ,
-                        targetSize: self.tileSize
-                    )
+                    if Self.useRawRendering {
+                        immediateRendered = Self.cropAndScaleRaw(
+                            sourceImage: previousImage,
+                            requested: requested,
+                            sourceZ: sourceZ,
+                            targetSize: self.tileSize
+                        )
+                    } else {
+                        immediateRendered = Self.cropAndScale(
+                            sourceImage: previousImage,
+                            requested: requested,
+                            sourceZ: sourceZ,
+                            targetSize: self.tileSize
+                        )
+                    }
                 }
 
                 if let immediateRendered,
@@ -1815,8 +1830,26 @@ struct UIKitMap: UIViewRepresentable {
                 completion(nil, -1, nil)
                 return
             }
+            Self.fetchSourceTile(
+                url: url,
+                timeout: 8,
+                z: z,
+                x: x,
+                y: y,
+                completion: completion
+            )
+        }
+
+        private static func fetchSourceTile(
+            url: URL,
+            timeout: TimeInterval,
+            z: Int,
+            x: Int,
+            y: Int,
+            completion: @escaping SourceTileCompletion
+        ) {
             let sourceCacheKey = url.absoluteString as NSString
-            if let cached = Self.sourceTileCache.object(forKey: sourceCacheKey) {
+            if let cached = sourceTileCache.object(forKey: sourceCacheKey) {
                 if ((x + y + z) & 31) == 0 {
                     print("☁️DBG source cache-hit z=\(z) x=\(x) y=\(y)")
                 }
@@ -1826,25 +1859,25 @@ struct UIKitMap: UIViewRepresentable {
 
             let requestKey = url.absoluteString
             var shouldStartRequest = false
-            Self.sourceFetchStateQueue.sync {
-                if Self.inFlightSourceRequests[requestKey] != nil {
-                    Self.inFlightSourceRequests[requestKey]?.append(completion)
+            sourceFetchStateQueue.sync {
+                if inFlightSourceRequests[requestKey] != nil {
+                    inFlightSourceRequests[requestKey]?.append(completion)
                     if ((x + y + z) & 31) == 0 {
                         print("☁️DBG source join in-flight z=\(z) x=\(x) y=\(y)")
                     }
                 } else {
-                    Self.inFlightSourceRequests[requestKey] = [completion]
+                    inFlightSourceRequests[requestKey] = [completion]
                     shouldStartRequest = true
                 }
             }
             if !shouldStartRequest { return }
 
             var request = URLRequest(url: url)
-            request.timeoutInterval = 8
-            request.setValue(Self.userAgent, forHTTPHeaderField: "User-Agent")
+            request.timeoutInterval = timeout
+            request.setValue(userAgent, forHTTPHeaderField: "User-Agent")
             request.setValue("image/png,image/*;q=0.9,*/*;q=0.5", forHTTPHeaderField: "Accept")
 
-            Self.networkSession.dataTask(with: request) { data, response, error in
+            networkSession.dataTask(with: request) { data, response, error in
                 let statusCode = (response as? HTTPURLResponse)?.statusCode ?? -1
                 if statusCode != 200 {
                     print("☁️ forecast tile z=\(z) x=\(x) y=\(y) status=\(statusCode) bytes=\(data?.count ?? 0)")
@@ -1852,15 +1885,15 @@ struct UIKitMap: UIViewRepresentable {
                     print("☁️ forecast tile 200 z=\(z) x=\(x) y=\(y) bytes=\(data?.count ?? 0)")
                 }
                 if statusCode == 200, let data, !data.isEmpty {
-                    Self.sourceTileCache.setObject(
+                    sourceTileCache.setObject(
                         data as NSData,
                         forKey: sourceCacheKey,
                         cost: data.count
                     )
                 }
-                let callbacks: [SourceTileCompletion] = Self.sourceFetchStateQueue.sync {
-                    let pending = Self.inFlightSourceRequests[requestKey] ?? []
-                    Self.inFlightSourceRequests.removeValue(forKey: requestKey)
+                let callbacks: [SourceTileCompletion] = sourceFetchStateQueue.sync {
+                    let pending = inFlightSourceRequests[requestKey] ?? []
+                    inFlightSourceRequests.removeValue(forKey: requestKey)
                     return pending
                 }
                 for callback in callbacks {
@@ -1900,7 +1933,7 @@ struct UIKitMap: UIViewRepresentable {
             guard fromTemplate != toTemplate else { return .zero }
             guard zoom >= 0, !tiles.isEmpty else { return nil }
 
-            let sampledTiles = sampleTiles(tiles, limit: 52)
+            let sampledTiles = sampleTiles(tiles, limit: 28)
             var fromCentroid = WeightedCentroid()
             var toCentroid = WeightedCentroid()
 
@@ -3893,6 +3926,69 @@ struct UIKitMap: UIViewRepresentable {
             }
             viewportSettledWorkItem = work
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.26, execute: work)
+        }
+
+        func animateForecastTemplateSwitch(using motion: CGPoint) {
+            stopForecastFade()
+            guard let renderer = forecastRenderer else { return }
+
+            let targetAlpha = currentForecastTargetAlpha
+            let toneDarkening = currentForecastToneDarkening
+            let effectiveMotion = isViewportChanging ? CGPoint.zero : motion
+            let clampedMotion = CGPoint(
+                x: max(-52, min(52, effectiveMotion.x)),
+                y: max(-52, min(52, effectiveMotion.y))
+            )
+            let hasMotion = abs(clampedMotion.x) + abs(clampedMotion.y) >= 1.2
+            let startOffset = hasMotion
+                ? CGPoint(x: -clampedMotion.x * 0.42, y: -clampedMotion.y * 0.42)
+                : .zero
+            let startAlpha = hasMotion
+                ? max(0.44, targetAlpha * 0.50)
+                : max(0.64, targetAlpha * 0.74)
+
+            renderer.alpha = startAlpha
+            renderer.toneDarkening = toneDarkening
+            renderer.transitionOffset = startOffset
+            renderer.setNeedsDisplay()
+
+            let duration: TimeInterval = hasMotion ? 0.40 : 0.24
+            let steps = max(1, Int(duration / (1.0 / 60.0)))
+            var step = 0
+
+            forecastFadeTimer = Timer.scheduledTimer(
+                withTimeInterval: duration / Double(steps),
+                repeats: true
+            ) { [weak self, weak renderer] timer in
+                guard let self, let renderer else {
+                    timer.invalidate()
+                    return
+                }
+
+                step += 1
+                let t = min(1.0, Double(step) / Double(steps))
+                let eased = t * t * (3.0 - 2.0 * t)
+                renderer.alpha = startAlpha + CGFloat(eased) * (targetAlpha - startAlpha)
+                renderer.toneDarkening = toneDarkening
+                renderer.transitionOffset = CGPoint(
+                    x: startOffset.x * CGFloat(1.0 - eased),
+                    y: startOffset.y * CGFloat(1.0 - eased)
+                )
+                renderer.setNeedsDisplay()
+
+                if step >= steps {
+                    timer.invalidate()
+                    self.forecastFadeTimer = nil
+                    renderer.alpha = targetAlpha
+                    renderer.toneDarkening = toneDarkening
+                    renderer.transitionOffset = .zero
+                    renderer.setNeedsDisplay()
+                }
+            }
+
+            if let timer = forecastFadeTimer {
+                RunLoop.main.add(timer, forMode: .common)
+            }
         }
 
         func startForecastFade(
