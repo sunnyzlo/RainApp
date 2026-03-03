@@ -16,8 +16,8 @@ struct WeatherService {
         https://api.open-meteo.com/v1/forecast\
         ?latitude=\(lat)\
         &longitude=\(lon)\
-        &current=temperature_2m,apparent_temperature,wind_speed_10m,relative_humidity_2m,weather_code\
-        &hourly=temperature_2m,apparent_temperature,wind_speed_10m,relative_humidity_2m,weather_code,precipitation\
+        &current=temperature_2m,apparent_temperature,wind_speed_10m,relative_humidity_2m,weather_code,is_day\
+        &hourly=temperature_2m,apparent_temperature,wind_speed_10m,relative_humidity_2m,weather_code,is_day,precipitation,precipitation_probability,cloud_cover,cloud_cover_low,cloud_cover_mid,cloud_cover_high\
         &timezone=auto
         """
 

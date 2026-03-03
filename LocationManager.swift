@@ -1,71 +1,82 @@
 import Foundation
 import CoreLocation
-import MapKit
 import Combine
 
-class LocationManager: NSObject, ObservableObject, CLLocationManagerDelegate {
+final class LocationManager: NSObject, ObservableObject, CLLocationManagerDelegate {
+    @Published var location: CLLocation?
+    @Published var city: String = "Locating..."
 
     private let manager = CLLocationManager()
     private let geocoder = CLGeocoder()
-    private var lastGeocodedLocation: CLLocation?
-    private var lastGeocodeAt: Date = .distantPast
-
-    @Published var location: CLLocation?
-    @Published var city: String = "Locating..."
+    private var lastGeocodedCoordinate: CLLocationCoordinate2D?
 
     override init() {
         super.init()
         manager.delegate = self
         manager.desiredAccuracy = kCLLocationAccuracyHundredMeters
-        manager.distanceFilter = 150
+        manager.distanceFilter = 50
         manager.requestWhenInUseAuthorization()
         manager.startUpdatingLocation()
     }
 
-    func locationManager(
-        _ manager: CLLocationManager,
-        didUpdateLocations locations: [CLLocation]
-    ) {
-        guard let loc = locations.last else { return }
-
-        location = loc
-
-        let shouldGeocode: Bool
-        if let last = lastGeocodedLocation {
-            let movedEnough = loc.distance(from: last) > 120
-            let enoughTimePassed = Date().timeIntervalSince(lastGeocodeAt) > 60
-            shouldGeocode = movedEnough || enoughTimePassed
-        } else {
-            shouldGeocode = true
-        }
-        guard shouldGeocode else { return }
-
-        if geocoder.isGeocoding {
-            geocoder.cancelGeocode()
-        }
-
-        geocoder.reverseGeocodeLocation(loc) { placemarks, _ in
-            guard let place = placemarks?.first else { return }
-
-            let district = place.subLocality ?? place.locality
-            let city = place.locality ?? place.administrativeArea ?? place.country ?? ""
-            let areaText: String
-            if let district, !district.isEmpty, !city.isEmpty, district != city {
-                areaText = "\(district), \(city)"
-            } else if let district, !district.isEmpty {
-                areaText = district
-            } else if !city.isEmpty {
-                areaText = city
-            } else {
-                areaText = "Locating..."
-            }
-
+    func locationManagerDidChangeAuthorization(_ manager: CLLocationManager) {
+        switch manager.authorizationStatus {
+        case .authorizedWhenInUse, .authorizedAlways:
+            manager.startUpdatingLocation()
+        case .denied, .restricted:
             DispatchQueue.main.async {
-                self.city = areaText
+                self.city = "Location denied"
+            }
+        case .notDetermined:
+            break
+        @unknown default:
+            break
+        }
+    }
+
+    func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {
+        guard let latest = locations.last else { return }
+        DispatchQueue.main.async {
+            self.location = latest
+        }
+        reverseGeocodeIfNeeded(for: latest)
+    }
+
+    func locationManager(_ manager: CLLocationManager, didFailWithError error: Error) {
+        _ = error
+    }
+
+    private func reverseGeocodeIfNeeded(for location: CLLocation) {
+        let coordinate = location.coordinate
+        if let last = lastGeocodedCoordinate {
+            let latDelta = abs(last.latitude - coordinate.latitude)
+            let lonDelta = abs(last.longitude - coordinate.longitude)
+            if latDelta < 0.01 && lonDelta < 0.01 {
+                return
             }
         }
+        lastGeocodedCoordinate = coordinate
 
-        lastGeocodedLocation = loc
-        lastGeocodeAt = Date()
+        geocoder.reverseGeocodeLocation(location) { [weak self] placemarks, _ in
+            guard let self else { return }
+            let placemark = placemarks?.first
+            let cityName =
+                placemark?.locality ??
+                placemark?.subAdministrativeArea ??
+                placemark?.administrativeArea ??
+                "Unknown"
+            let districtName =
+                placemark?.subLocality ??
+                placemark?.subAdministrativeArea
+            let displayName: String = {
+                guard let districtName, !districtName.isEmpty, districtName != cityName else {
+                    return cityName
+                }
+                return "\(cityName), \(districtName)"
+            }()
+            DispatchQueue.main.async {
+                self.city = displayName
+            }
+        }
     }
 }
