@@ -58,6 +58,7 @@ struct CloudOverlayService {
     static func fetchForecastFrame(
         targetDate: Date,
         near coordinate: CLLocationCoordinate2D? = nil,
+        probeSignalNearUser: Bool = true,
         completion: @escaping (ForecastResult) -> Void
     ) {
         queue.async {
@@ -67,7 +68,8 @@ struct CloudOverlayService {
                 let frame = pickFrame(
                     from: cached,
                     targetDate: targetDate,
-                    near: coordinate
+                    near: coordinate,
+                    probeSignalNearUser: probeSignalNearUser
                 )
             {
                 DispatchQueue.main.async {
@@ -76,7 +78,7 @@ struct CloudOverlayService {
                 return
             }
 
-            pendingRequests.append((targetDate, coordinate, completion))
+            pendingRequests.append((targetDate, coordinate, probeSignalNearUser, completion))
             if isFetchingAvailable { return }
             isFetchingAvailable = true
             fetchAvailable()
@@ -122,7 +124,7 @@ struct CloudOverlayService {
     private static var cachedAt: Date = .distantPast
     private static var isFetchingAvailable = false
     private static var pendingRequests: [
-        (Date, CLLocationCoordinate2D?, (ForecastResult) -> Void)
+        (Date, CLLocationCoordinate2D?, Bool, (ForecastResult) -> Void)
     ] = []
     private static var signalProbeCache: [String: (value: Bool, at: Date)] = [:]
     private static var signalTileCache: [String: (value: Bool, at: Date)] = [:]
@@ -171,11 +173,12 @@ struct CloudOverlayService {
         let requests = pendingRequests
         pendingRequests.removeAll()
 
-        for (targetDate, coordinate, completion) in requests {
+        for (targetDate, coordinate, probeSignalNearUser, completion) in requests {
             if let frame = pickFrame(
                 from: cached,
                 targetDate: targetDate,
-                near: coordinate
+                near: coordinate,
+                probeSignalNearUser: probeSignalNearUser
             ) {
                 DispatchQueue.main.async {
                     completion(.success(frame))
@@ -192,7 +195,7 @@ struct CloudOverlayService {
         let requests = pendingRequests
         pendingRequests.removeAll()
 
-        for (_, _, completion) in requests {
+        for (_, _, _, completion) in requests {
             DispatchQueue.main.async {
                 completion(result)
             }
@@ -202,7 +205,8 @@ struct CloudOverlayService {
     private static func pickFrame(
         from available: AvailableResponse,
         targetDate: Date,
-        near coordinate: CLLocationCoordinate2D?
+        near coordinate: CLLocationCoordinate2D?,
+        probeSignalNearUser: Bool
     ) -> ForecastFrame? {
         let minZoom = available.minzoom ?? 0
         let maxZoom = max(minZoom, available.maxzoom ?? 6)
@@ -229,7 +233,7 @@ struct CloudOverlayService {
             return nil
         }
 
-        guard let coordinate else {
+        guard probeSignalNearUser, let coordinate else {
             return selected
         }
 

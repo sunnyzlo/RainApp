@@ -5,6 +5,7 @@ import ImageIO
 import UniformTypeIdentifiers
 
 struct UIKitMap: UIViewRepresentable {
+    private static let forecastCacheVersion = "v56"
 
     struct VisibleTile: Hashable {
         let x: Int
@@ -25,6 +26,7 @@ struct UIKitMap: UIViewRepresentable {
     var location: CLLocation?
     var radarFramePath: String?
     var cloudCells: [CloudOverlayService.CloudCell] = []
+    var cloudTime: Date? = nil
     var forecastTileTemplate: String?
     var forecastTileMinZoom: Int = 0
     var forecastTileMaxZoom: Int = 6
@@ -40,6 +42,7 @@ struct UIKitMap: UIViewRepresentable {
         map.userTrackingMode = .none
         map.showsCompass = false
         map.delegate = context.coordinator
+        ensureAppleBaseMap(map: map, coordinator: context.coordinator)
         context.coordinator.installControls(on: map)
         applyTheme(to: map, coordinator: context.coordinator)
 
@@ -53,6 +56,7 @@ struct UIKitMap: UIViewRepresentable {
 
     func updateUIView(_ map: MKMapView, context: Context) {
         context.coordinator.parent = self
+        ensureAppleBaseMap(map: map, coordinator: context.coordinator)
         applyTheme(to: map, coordinator: context.coordinator)
 
         if useStaticOverlay {
@@ -97,6 +101,17 @@ struct UIKitMap: UIViewRepresentable {
                 clearWeatherOverlay(map: map, coordinator: context.coordinator)
                 addRadarOverlay(path: path, map: map, coordinator: context.coordinator)
             } else {
+                // Do not drop a valid forecast overlay during transient metadata/template gaps.
+                // This prevents visible "empty map" flashes while frame selection updates.
+                if context.coordinator.forecastOverlay != nil, cloudCells.isEmpty {
+                    context.coordinator.logOverlayModeIfChanged(
+                        mode: "forecast-hold",
+                        key: "keep-last",
+                        map: map
+                    )
+                    clearRadarOverlay(map: map, coordinator: context.coordinator)
+                    return
+                }
                 context.coordinator.logOverlayModeIfChanged(
                     mode: "weather",
                     key: "cells=\(cloudCells.count)",
@@ -114,7 +129,7 @@ struct UIKitMap: UIViewRepresentable {
 
         context.coordinator.updateControlsLayout(for: map)
         context.coordinator.syncControlsState(for: map)
-        context.coordinator.publishVisibleTileSnapshot(for: map)
+        context.coordinator.scheduleVisibleTileSnapshot(for: map)
 
         guard let loc = location else { return }
 
@@ -220,6 +235,26 @@ struct UIKitMap: UIViewRepresentable {
         Coordinator(self)
     }
 
+    private func ensureAppleBaseMap(
+        map: MKMapView,
+        coordinator: Coordinator
+    ) {
+        for overlay in map.overlays where overlay is BaseMapOverlay {
+            map.removeOverlay(overlay)
+        }
+        if let baseOverlay = coordinator.baseMapOverlay {
+            map.removeOverlay(baseOverlay)
+            coordinator.baseMapOverlay = nil
+        }
+
+        map.mapType = .standard
+        if #available(iOS 13.0, *) {
+            let config = MKStandardMapConfiguration(elevationStyle: .realistic)
+            config.emphasisStyle = .default
+            map.preferredConfiguration = config
+        }
+    }
+
     // MARK: Radar overlay
 
     private func clearRadarOverlay(
@@ -259,6 +294,11 @@ struct UIKitMap: UIViewRepresentable {
         coordinator: Coordinator
     ) {
         coordinator.stopForecastFade()
+        if let pending = coordinator.pendingForecastPreviousOverlay {
+            map.removeOverlay(pending)
+            coordinator.pendingForecastPreviousOverlay = nil
+            coordinator.pendingForecastPreviousRenderer = nil
+        }
         coordinator.clearPendingForecastOverlay(on: map)
         guard let overlay = coordinator.forecastOverlay else { return }
         map.removeOverlay(overlay)
@@ -275,63 +315,26 @@ struct UIKitMap: UIViewRepresentable {
         coordinator: Coordinator
     ) {
         let key = "\(template)|\(minZoom)|\(maxZoom)"
-        if coordinator.lastForecastOverlayKey == key {
-            print("☁️DBG forecast overlay skip (same key)")
-            return
-        }
+        if coordinator.lastForecastOverlayKey == key { return }
         coordinator.lastForecastOverlayKey = key
 
+        coordinator.stopForecastFade()
+        coordinator.clearPendingForecastOverlay(on: map, keeping: coordinator.forecastOverlay)
+        coordinator.pendingForecastMotion = .zero
+
         if let existing = coordinator.forecastOverlay as? ForecastTileOverlay {
-            let fromTemplate = existing.currentTemplateIdentifier()
-
-            // Same frame template (e.g. only zoom bounds changed): update in place.
-            if fromTemplate == template {
-                if existing.updateSource(
-                    urlTemplate: template,
-                    minSourceZ: minZoom,
-                    maxSourceZ: maxZoom
-                ) {
-                    coordinator.pendingForecastMotion = .zero
-                    coordinator.stopForecastFade()
-                    coordinator.clearPendingForecastOverlay(on: map)
-                    coordinator.forecastRenderer?.alpha = coordinator.currentForecastTargetAlpha
-                    coordinator.forecastRenderer?.toneDarkening = coordinator.currentForecastToneDarkening
-                    coordinator.forecastRenderer?.transitionOffset = .zero
-                    coordinator.forecastRenderer?.reloadData()
-                    print("☁️ Forecast tiles UPDATE (reuse overlay):", key)
-                } else {
-                    print("☁️DBG forecast overlay reuse called, but source unchanged")
-                }
-                return
-            }
-
-            // New frame template: update same overlay instance.
-            // This avoids renderer churn that can leave the layer transparent
-            // during rapid slider scrubbing.
             if existing.updateSource(
                 urlTemplate: template,
                 minSourceZ: minZoom,
                 maxSourceZ: maxZoom
             ) {
-                coordinator.pendingForecastMotion = .zero
-                coordinator.stopForecastFade()
-                coordinator.clearPendingForecastOverlay(on: map)
-                coordinator.forecastRenderer?.alpha = coordinator.currentForecastTargetAlpha
-                coordinator.forecastRenderer?.toneDarkening = coordinator.currentForecastToneDarkening
-                coordinator.forecastRenderer?.transitionOffset = .zero
-                coordinator.forecastRenderer?.reloadData()
-                print("☁️ Forecast tiles UPDATE (reuse overlay frame):", key)
-            } else {
-                print("☁️DBG forecast overlay frame update called, but source unchanged")
+                if let renderer = coordinator.forecastRenderer {
+                    renderer.reloadData()
+                }
+                print("☁️DBG forecast mode=single-overlay cache=\(Self.forecastCacheVersion)")
+                print("☁️ Forecast tiles UPDATE (single overlay):", key)
             }
             return
-        }
-
-        coordinator.stopForecastFade()
-        coordinator.clearPendingForecastOverlay(on: map)
-        coordinator.pendingForecastMotion = .zero
-        if let oldOverlay = coordinator.forecastOverlay {
-            map.removeOverlay(oldOverlay)
         }
 
         let overlay = ForecastTileOverlay(
@@ -342,7 +345,8 @@ struct UIKitMap: UIViewRepresentable {
         coordinator.forecastOverlay = overlay
         coordinator.forecastRenderer = nil
         map.addOverlay(overlay, level: .aboveLabels)
-        print("☁️ Forecast tiles UPDATE (new overlay):", key)
+        print("☁️DBG forecast mode=single-overlay cache=\(Self.forecastCacheVersion)")
+        print("☁️ Forecast tiles UPDATE (single overlay):", key)
     }
 
     // MARK: Static overlay (PNG from Assets)
@@ -372,9 +376,15 @@ struct UIKitMap: UIViewRepresentable {
         map: MKMapView,
         coordinator: Coordinator
     ) {
-        guard let overlay = coordinator.weatherOverlay else { return }
-        map.removeOverlay(overlay)
-        coordinator.weatherOverlay = nil
+        coordinator.stopWeatherFade(on: map)
+        if !coordinator.pendingWeatherPreviousOverlays.isEmpty {
+            map.removeOverlays(coordinator.pendingWeatherPreviousOverlays)
+            coordinator.pendingWeatherPreviousOverlays.removeAll()
+        }
+        guard !coordinator.weatherOverlays.isEmpty else { return }
+        map.removeOverlays(coordinator.weatherOverlays)
+        coordinator.weatherOverlays.removeAll()
+        coordinator.weatherOverlayAlpha.removeAll()
         coordinator.lastWeatherSignature = nil
     }
 
@@ -384,8 +394,10 @@ struct UIKitMap: UIViewRepresentable {
         coordinator: Coordinator
     ) {
         var hasher = Hasher()
-        hasher.combine(4) // rendering profile version
+        hasher.combine(5) // rendering profile version
         hasher.combine(cells.count)
+        let hourStamp = Int((cloudTime ?? Date()).timeIntervalSince1970 / 3600)
+        hasher.combine(hourStamp)
         for cell in cells {
             hasher.combine(Int((cell.center.latitude * 1000).rounded()))
             hasher.combine(Int((cell.center.longitude * 1000).rounded()))
@@ -398,66 +410,99 @@ struct UIKitMap: UIViewRepresentable {
         guard coordinator.lastWeatherSignature != signature else { return }
         coordinator.lastWeatherSignature = signature
 
-        if let old = coordinator.weatherOverlay {
-            map.removeOverlay(old)
-            coordinator.weatherOverlay = nil
-        }
-
         guard !cells.isEmpty else { return }
         let maxRain = cells.map(\.rainIntensity).max() ?? 0
         let maxStorm = cells.map(\.stormRisk).max() ?? 0
         print("☁️ overlay signal maxRain=\(String(format: "%.3f", maxRain)) maxStorm=\(String(format: "%.3f", maxStorm))")
-        guard let overlay = Self.makeWeatherFieldOverlay(from: cells) else { return }
+        let incoming = Self.makeWeatherBlobOverlays(from: cells)
+        if incoming.isEmpty {
+            clearWeatherOverlay(map: map, coordinator: coordinator)
+            return
+        }
 
-        coordinator.weatherOverlay = overlay
-        map.addOverlay(overlay, level: .aboveLabels)
+        coordinator.stopWeatherFade(on: map)
+        let outgoing = coordinator.weatherOverlays
+        if !outgoing.isEmpty {
+            coordinator.pendingWeatherPreviousOverlays = outgoing
+        }
+
+        map.addOverlays(incoming, level: .aboveLabels)
+        coordinator.weatherOverlays = incoming
+
+        for overlay in incoming {
+            coordinator.weatherOverlayAlpha[ObjectIdentifier(overlay)] = 1.0
+        }
+
+        if outgoing.isEmpty {
+            return
+        }
+
+        coordinator.startWeatherFade(
+            on: map,
+            outgoing: outgoing,
+            incoming: incoming
+        )
     }
 
-    private static func makeWeatherFieldOverlay(
+    private static func makeWeatherBlobOverlays(
         from cells: [CloudOverlayService.CloudCell]
-    ) -> WeatherFieldOverlay? {
-        guard let first = cells.first else { return nil }
-        let gridSize = first.gridSize
-        guard gridSize > 1 else { return nil }
+    ) -> [WeatherBlobOverlay] {
+        guard !cells.isEmpty else { return [] }
+        let minRain = cells.map(\.rainIntensity).min() ?? 0
+        let maxRain = max(0.01, cells.map(\.rainIntensity).max() ?? 0.01)
+        let rainRange = max(0.003, maxRain - minRain)
+        let maxStorm = max(0.12, cells.map(\.stormRisk).max() ?? 0.12)
 
-        var rain = Array(repeating: 0.0, count: gridSize * gridSize)
-        var storm = Array(repeating: 0.0, count: gridSize * gridSize)
+        var out: [WeatherBlobOverlay] = []
+        out.reserveCapacity(cells.count)
 
         for cell in cells {
-            guard cell.gridSize == gridSize else { continue }
-            guard cell.row >= 0, cell.row < gridSize else { continue }
-            guard cell.col >= 0, cell.col < gridSize else { continue }
-            let idx = cell.row * gridSize + cell.col
-            rain[idx] = cell.rainIntensity
-            storm[idx] = cell.stormRisk
-        }
+            let baseRainNorm = clamp01((cell.rainIntensity - minRain) / rainRange)
+            let texture = cloudTexture(latitude: cell.center.latitude, longitude: cell.center.longitude)
+            let rainNorm = clamp01(baseRainNorm * 0.75 + texture * 0.25)
+            let stormNorm = clamp01(cell.stormRisk / maxStorm)
+            if rainNorm < 0.03 && stormNorm < 0.10 { continue }
 
-        let rainSmooth = smoothedMatrix(rain, gridSize: gridSize, passes: 2)
-        let stormSmooth = smoothedMatrix(storm, gridSize: gridSize, passes: 1)
-
-        guard
-            let image = makeWeatherImage(
-                rain: rainSmooth,
-                storm: stormSmooth,
-                gridSize: gridSize
+            let snowNorm =
+                clamp01((0.62 - rainNorm) / 0.62) *
+                clamp01(1.0 - stormNorm * 1.25)
+            let (red, green, blue, alpha) = weatherPaletteComponents(
+                rainNorm: rainNorm,
+                stormNorm: stormNorm,
+                snowNorm: snowNorm
             )
-        else {
-            return nil
+
+            let stepMeters = max(
+                2_500.0,
+                cell.stepDegrees * 111_000.0 * 0.9
+            )
+            let radiusMeters = stepMeters * (0.55 + 0.35 * rainNorm)
+            let fillAlpha = clamp01(alpha * (0.10 + 0.12 * rainNorm))
+            if fillAlpha < 0.02 { continue }
+
+            let color = UIColor(
+                red: CGFloat(red / 255.0),
+                green: CGFloat(green / 255.0),
+                blue: CGFloat(blue / 255.0),
+                alpha: CGFloat(fillAlpha)
+            )
+            out.append(
+                WeatherBlobOverlay(
+                    center: cell.center,
+                    radiusMeters: radiusMeters,
+                    color: color
+                )
+            )
         }
 
-        let minLat = cells.map { $0.center.latitude }.min() ?? 0
-        let maxLat = cells.map { $0.center.latitude }.max() ?? 0
-        let minLon = cells.map { $0.center.longitude }.min() ?? 0
-        let maxLon = cells.map { $0.center.longitude }.max() ?? 0
-        let pad = first.stepDegrees * 0.5
+        return out
+    }
 
-        return WeatherFieldOverlay(
-            image: image,
-            minLatitude: minLat - pad,
-            maxLatitude: maxLat + pad,
-            minLongitude: minLon - pad,
-            maxLongitude: maxLon + pad
-        )
+    private static func cloudTexture(latitude: Double, longitude: Double) -> Double {
+        let a = sin(latitude * 0.33 + longitude * 0.19)
+        let b = sin(latitude * 0.81 - longitude * 0.27)
+        let c = cos(latitude * 1.47 + longitude * 0.73)
+        return clamp01((a * 0.45 + b * 0.35 + c * 0.20 + 1.0) * 0.5)
     }
 
     private static func makeWeatherImage(
@@ -469,23 +514,8 @@ struct UIKitMap: UIViewRepresentable {
         let maxStorm = storm.max() ?? 0
         if maxRain < 0.008 && maxStorm < 0.05 { return nil }
 
-        let sortedRain = rain.sorted()
-        let baselineIndex = min(
-            max(0, Int(Double(sortedRain.count - 1) * 0.20)),
-            max(0, sortedRain.count - 1)
-        )
-        let rainBaselineRaw = sortedRain.isEmpty ? 0 : sortedRain[baselineIndex]
-        let rainBaseline = rainBaselineRaw * 0.70
-        var rainSpread = max(0, maxRain - rainBaseline)
-        if rainSpread < 0.004 {
-            rainSpread = max(0.03, maxRain * 0.65)
-        }
-        if rainSpread < 0.004 && maxStorm < 0.08 { return nil }
-
-        let stormBaseline = max(0.0, min(maxStorm * 0.35, 0.16))
-
-        let width = 900
-        let height = 900
+        let width = 1024
+        let height = 1024
         let bitmapInfo =
             CGImageAlphaInfo.premultipliedLast.rawValue |
             CGBitmapInfo.byteOrder32Big.rawValue
@@ -502,55 +532,73 @@ struct UIKitMap: UIViewRepresentable {
             return nil
         }
 
-        guard let bytes = context.data else { return nil }
-        let ptr = bytes.bindMemory(to: UInt8.self, capacity: width * height * 4)
         context.clear(CGRect(x: 0, y: 0, width: width, height: height))
+        context.setBlendMode(.normal)
+        context.setShouldAntialias(true)
+        context.interpolationQuality = .high
 
-        for y in 0..<height {
-            // Matrix row 0 is south; image y=0 is north, so flip vertically.
-            let gy = Double(height - 1 - y) * Double(gridSize - 1) / Double(height - 1)
-            for x in 0..<width {
-                let gx = Double(x) * Double(gridSize - 1) / Double(width - 1)
+        let dx = Double(width - 1) / Double(max(1, gridSize - 1))
+        let dy = Double(height - 1) / Double(max(1, gridSize - 1))
+        var painted = 0
 
-                let rainValue = bilinear(rain, gridSize: gridSize, x: gx, y: gy)
-                let stormValue = bilinear(storm, gridSize: gridSize, x: gx, y: gy)
+        for row in 0..<gridSize {
+            for col in 0..<gridSize {
+                let idx = row * gridSize + col
+                if idx >= rain.count || idx >= storm.count { continue }
 
-                let effectiveRain = max(0, rainValue - rainBaseline)
-                let rainNorm = max(0.0, min(1.0, effectiveRain / max(0.08, rainSpread)))
-                let stormNorm = max(
-                    0.0,
-                    min(1.0, (stormValue - stormBaseline) / max(0.08, maxStorm - stormBaseline))
+                let rainNorm = clamp01(rain[idx] / max(0.018, maxRain))
+                let stormNorm = clamp01(storm[idx] / max(0.12, maxStorm))
+                if rainNorm < 0.02 && stormNorm < 0.10 { continue }
+
+                let snowNorm =
+                    clamp01((0.62 - rainNorm) / 0.62) *
+                    clamp01(1.0 - stormNorm * 1.25)
+                let (red, green, blue, alphaBase) = weatherPaletteComponents(
+                    rainNorm: rainNorm,
+                    stormNorm: stormNorm,
+                    snowNorm: snowNorm
                 )
-                if rainNorm < 0.01 && stormNorm < 0.03 { continue }
+                let centerAlpha = clamp01(alphaBase * (0.38 + rainNorm * 0.48))
+                if centerAlpha < 0.02 { continue }
 
-                var red = lerp(32.0, 8.0, rainNorm)
-                var green = lerp(150.0, 52.0, rainNorm)
-                var blue = lerp(255.0, 175.0, rainNorm)
-                var alpha = 0.18 + rainNorm * 0.58
+                let cx = Double(col) * dx
+                // Grid row 0 is south, image y=0 is north.
+                let cy = Double(gridSize - 1 - row) * dy
+                let radius = min(Double(width), Double(height)) /
+                    Double(max(2, gridSize - 1)) *
+                    (0.95 + rainNorm * 0.95)
 
-                if stormNorm > 0.04 {
-                    let s = max(0.0, min(1.0, stormNorm * 1.2))
-                    red = mix(red, 4.0, s)
-                    green = mix(green, 4.0, s)
-                    blue = mix(blue, 10.0, s)
-                    alpha = max(alpha, 0.26 + s * 0.54)
-                }
+                let colorCenter = UIColor(
+                    red: CGFloat(red / 255.0),
+                    green: CGFloat(green / 255.0),
+                    blue: CGFloat(blue / 255.0),
+                    alpha: CGFloat(centerAlpha)
+                ).cgColor
+                let colorEdge = UIColor(
+                    red: CGFloat(red / 255.0),
+                    green: CGFloat(green / 255.0),
+                    blue: CGFloat(blue / 255.0),
+                    alpha: 0
+                ).cgColor
+                guard let gradient = CGGradient(
+                    colorsSpace: CGColorSpaceCreateDeviceRGB(),
+                    colors: [colorCenter, colorEdge] as CFArray,
+                    locations: [0.0, 1.0]
+                ) else { continue }
 
-                let u = Double(x) / Double(width - 1)
-                let v = Double(y) / Double(height - 1)
-                let edge = min(min(u, 1.0 - u), min(v, 1.0 - v))
-                let feather = smoothstep(0.02, 0.16, edge)
-                alpha *= feather
-
-                let a = max(0.0, min(1.0, alpha))
-                let idx = (y * width + x) * 4
-                ptr[idx] = UInt8(max(0.0, min(255.0, red * a)).rounded())
-                ptr[idx + 1] = UInt8(max(0.0, min(255.0, green * a)).rounded())
-                ptr[idx + 2] = UInt8(max(0.0, min(255.0, blue * a)).rounded())
-                ptr[idx + 3] = UInt8((255.0 * a).rounded())
+                context.drawRadialGradient(
+                    gradient,
+                    startCenter: CGPoint(x: cx, y: cy),
+                    startRadius: 0,
+                    endCenter: CGPoint(x: cx, y: cy),
+                    endRadius: CGFloat(radius),
+                    options: [.drawsAfterEndLocation]
+                )
+                painted += 1
             }
         }
 
+        if painted == 0 { return nil }
         guard let cgImage = context.makeImage() else { return nil }
         return UIImage(cgImage: cgImage)
     }
@@ -629,6 +677,38 @@ struct UIKitMap: UIViewRepresentable {
         a + (b - a) * t
     }
 
+    private static func clamp01(_ value: Double) -> Double {
+        max(0.0, min(1.0, value))
+    }
+
+    private static func weatherPaletteComponents(
+        rainNorm: Double,
+        stormNorm: Double,
+        snowNorm: Double
+    ) -> (Double, Double, Double, Double) {
+        let rain = clamp01(rainNorm)
+        let snow = clamp01(snowNorm)
+
+        // Cloud palette: soft white/gray-blue, no dark storm fill.
+        var red = lerp(226.0, 196.0, rain)
+        var green = lerp(233.0, 208.0, rain)
+        var blue = lerp(241.0, 224.0, rain)
+        var alpha = 0.10 + rain * 0.22
+
+        if snow > 0.08 {
+            let snowMix = 0.45 + 0.35 * snow
+            let snowRed = 245.0
+            let snowGreen = 247.0
+            let snowBlue = 250.0
+            red = mix(red, snowRed, snowMix)
+            green = mix(green, snowGreen, snowMix)
+            blue = mix(blue, snowBlue, snowMix)
+            alpha = max(alpha, 0.14 + rain * 0.18)
+        }
+
+        return (red, green, blue, clamp01(alpha))
+    }
+
     private static func lerp(_ a: Double, _ b: Double, _ t: Double) -> Double {
         a + (b - a) * t
     }
@@ -639,61 +719,53 @@ struct UIKitMap: UIViewRepresentable {
         return t * t * (3.0 - 2.0 * t)
     }
 
-    final class WeatherFieldOverlay: NSObject, MKOverlay {
-        let image: UIImage
+    final class WeatherBlobOverlay: NSObject, MKOverlay {
         let coordinate: CLLocationCoordinate2D
         let boundingMapRect: MKMapRect
+        let color: UIColor
 
-        init(
-            image: UIImage,
-            minLatitude: Double,
-            maxLatitude: Double,
-            minLongitude: Double,
-            maxLongitude: Double
-        ) {
-            self.image = image
-
-            let centerLat = (minLatitude + maxLatitude) * 0.5
-            let centerLon = (minLongitude + maxLongitude) * 0.5
-            self.coordinate = CLLocationCoordinate2D(
-                latitude: centerLat,
-                longitude: centerLon
+        init(center: CLLocationCoordinate2D, radiusMeters: Double, color: UIColor) {
+            self.coordinate = center
+            self.color = color
+            let centerPoint = MKMapPoint(center)
+            let pointsPerMeter = MKMapPointsPerMeterAtLatitude(center.latitude)
+            let radiusMapPoints = max(1.0, radiusMeters * pointsPerMeter)
+            self.boundingMapRect = MKMapRect(
+                x: centerPoint.x - radiusMapPoints,
+                y: centerPoint.y - radiusMapPoints,
+                width: radiusMapPoints * 2,
+                height: radiusMapPoints * 2
             )
-
-            let topLeft = MKMapPoint(
-                CLLocationCoordinate2D(
-                    latitude: maxLatitude,
-                    longitude: minLongitude
-                )
-            )
-            let bottomRight = MKMapPoint(
-                CLLocationCoordinate2D(
-                    latitude: minLatitude,
-                    longitude: maxLongitude
-                )
-            )
-
-            let x = min(topLeft.x, bottomRight.x)
-            let y = min(topLeft.y, bottomRight.y)
-            let width = abs(bottomRight.x - topLeft.x)
-            let height = abs(bottomRight.y - topLeft.y)
-            self.boundingMapRect = MKMapRect(x: x, y: y, width: width, height: height)
         }
     }
 
-    final class WeatherFieldRenderer: MKOverlayRenderer {
+    final class WeatherBlobRenderer: MKOverlayRenderer {
         override func draw(
             _ mapRect: MKMapRect,
             zoomScale: MKZoomScale,
             in context: CGContext
         ) {
-            guard let overlay = overlay as? WeatherFieldOverlay else { return }
-            guard let cgImage = overlay.image.cgImage else { return }
-
+            guard let overlay = overlay as? WeatherBlobOverlay else { return }
             let rect = self.rect(for: overlay.boundingMapRect)
-            context.interpolationQuality = .high
             context.setShouldAntialias(true)
-            context.draw(cgImage, in: rect)
+            let center = CGPoint(x: rect.midX, y: rect.midY)
+            let radius = max(rect.width, rect.height) * 0.5
+            let colorCenter = overlay.color.cgColor
+            let colorEdge = overlay.color.withAlphaComponent(0).cgColor
+            guard let gradient = CGGradient(
+                colorsSpace: CGColorSpaceCreateDeviceRGB(),
+                colors: [colorCenter, colorEdge] as CFArray,
+                locations: [0.0, 1.0]
+            ) else { return }
+
+            context.drawRadialGradient(
+                gradient,
+                startCenter: center,
+                startRadius: 0,
+                endCenter: center,
+                endRadius: radius,
+                options: [.drawsAfterEndLocation]
+            )
         }
     }
 
@@ -707,30 +779,135 @@ struct UIKitMap: UIViewRepresentable {
             in context: CGContext
         ) {
             context.saveGState()
+            // Prevent tile-edge seams from subpixel filtering on transformed quads.
+            context.interpolationQuality = .none
+            context.setShouldAntialias(false)
+            context.setAllowsAntialiasing(false)
             if transitionOffset != .zero {
                 context.translateBy(x: transitionOffset.x, y: transitionOffset.y)
             }
             super.draw(mapRect, zoomScale: zoomScale, in: context)
-            if toneDarkening > 0 {
-                context.setBlendMode(.sourceAtop)
-                context.setFillColor(
-                    UIColor(white: 0.0, alpha: toneDarkening).cgColor
-                )
-                context.fill(rect(for: mapRect))
-            }
+            // Disable extra darkening; it crushes the blue gradient.
             context.restoreGState()
+        }
+    }
+
+    final class BaseMapOverlay: MKTileOverlay {
+        private static let userAgent = "RainApp/1.0 (+https://github.com/alex/RainApp)"
+        private static let sampleModulo = 64
+        private static let placeholderTileData: Data? = {
+            let size = 256
+            let bitmapInfo =
+                CGImageAlphaInfo.premultipliedLast.rawValue |
+                CGBitmapInfo.byteOrder32Big.rawValue
+
+            guard let context = CGContext(
+                data: nil,
+                width: size,
+                height: size,
+                bitsPerComponent: 8,
+                bytesPerRow: 0,
+                space: CGColorSpaceCreateDeviceRGB(),
+                bitmapInfo: bitmapInfo
+            ) else {
+                return nil
+            }
+
+            context.setFillColor(UIColor(red: 0.82, green: 0.84, blue: 0.86, alpha: 1).cgColor)
+            context.fill(CGRect(x: 0, y: 0, width: size, height: size))
+
+            context.setStrokeColor(UIColor(red: 0.68, green: 0.71, blue: 0.74, alpha: 1).cgColor)
+            context.setLineWidth(1.0)
+            let step = 32
+            for i in stride(from: 0, through: size, by: step) {
+                context.move(to: CGPoint(x: i, y: 0))
+                context.addLine(to: CGPoint(x: i, y: size))
+                context.move(to: CGPoint(x: 0, y: i))
+                context.addLine(to: CGPoint(x: size, y: i))
+            }
+            context.strokePath()
+
+            let output = NSMutableData()
+            guard let image = context.makeImage(),
+                  let destination = CGImageDestinationCreateWithData(
+                    output,
+                    UTType.png.identifier as CFString,
+                    1,
+                    nil
+                  ) else {
+                return nil
+            }
+            CGImageDestinationAddImage(destination, image, nil)
+            guard CGImageDestinationFinalize(destination) else { return nil }
+            return output as Data
+        }()
+
+        override init(urlTemplate URLTemplate: String?) {
+            super.init(urlTemplate: URLTemplate)
+            tileSize = CGSize(width: 256, height: 256)
+            minimumZ = 0
+            maximumZ = 19
+            canReplaceMapContent = false
+            isGeometryFlipped = false
+        }
+
+        convenience init() {
+            self.init(urlTemplate: nil)
+        }
+
+        override func loadTile(
+            at path: MKTileOverlayPath,
+            result: @escaping (Data?, Error?) -> Void
+        ) {
+            let z = min(max(0, path.z), 19)
+            let n = max(1, 1 << z)
+            let x = ((path.x % n) + n) % n
+            guard path.y >= 0, path.y < n else {
+                result(Self.placeholderTileData, nil)
+                return
+            }
+            let urlString = "https://tile.openstreetmap.org/\(z)/\(x)/\(path.y).png"
+            guard let url = URL(string: urlString) else {
+                result(Self.placeholderTileData, nil)
+                return
+            }
+
+            var request = URLRequest(url: url)
+            request.timeoutInterval = 7
+            request.setValue(Self.userAgent, forHTTPHeaderField: "User-Agent")
+            request.setValue("image/png,image/*;q=0.9,*/*;q=0.5", forHTTPHeaderField: "Accept")
+
+            URLSession.shared.dataTask(with: request) { data, response, _ in
+                let statusCode = (response as? HTTPURLResponse)?.statusCode ?? -1
+                let shouldSample = ((path.x + path.y + path.z) & (Self.sampleModulo - 1)) == 0
+                if statusCode == 200, let data, !data.isEmpty {
+                    if shouldSample {
+                        print("🗺 base tile 200 z=\(path.z) x=\(path.x) y=\(path.y) bytes=\(data.count)")
+                    }
+                    result(data, nil)
+                    return
+                }
+
+                if shouldSample {
+                    print("🗺 base tile fallback z=\(path.z) x=\(path.x) y=\(path.y) status=\(statusCode)")
+                }
+                result(Self.placeholderTileData, nil)
+            }.resume()
         }
     }
 
     class ForecastTileOverlay: MKTileOverlay {
 
-        private let overzoomLevels = 20
+        // Keep overlay visible at close zoom levels even when source max zoom is limited.
+        // Source often ends at z=7, while device can go much closer than z=11.
+        private let overzoomLevels = 12
         private let stateQueue = DispatchQueue(
             label: "RainApp.ForecastTileOverlay.state",
             attributes: .concurrent
         )
         private var template: String
         private var fallbackTemplate: String?
+        private var fallbackTemplateSetAt: TimeInterval = 0
         private var minSourceZ: Int
         private var maxSourceZ: Int
 
@@ -738,17 +915,28 @@ struct UIKitMap: UIViewRepresentable {
             let data: Data
             let visiblePixelCount: Int
         }
+        private final class DecodedSourceImageBox {
+            let image: CGImage
+
+            init(_ image: CGImage) {
+                self.image = image
+            }
+        }
         private static let useRawRendering = true
+        private static let debugLoggingEnabled = true
+        private static let debugSampleMask = 63
         // Keep fallback permissive so cloud layer does not disappear between frame swaps.
         private static let minVisiblePixelsForGenericFallback = 1
+        private static let minVisiblePixelsForGenericStore = 2
+        private static let minVisiblePixelsToTrustCurrentTile = 6
 
         private static let userAgent =
             "RainApp/1.0 (+https://github.com/alex/RainApp)"
-        private static let cacheVersion = "v19"
+        private static let cacheVersion = UIKitMap.forecastCacheVersion
         private static let renderedTileCache: NSCache<NSString, NSData> = {
             let cache = NSCache<NSString, NSData>()
-            cache.countLimit = 2200
-            cache.totalCostLimit = 48 * 1024 * 1024
+            cache.countLimit = 3000
+            cache.totalCostLimit = 72 * 1024 * 1024
             return cache
         }()
         private static let stickyTileCache: NSCache<NSString, NSData> = {
@@ -762,10 +950,17 @@ struct UIKitMap: UIViewRepresentable {
             attributes: .concurrent
         )
         private static var stickyTileUpdatedAt: [String: TimeInterval] = [:]
-        private static let stickyTileMaxAge: TimeInterval = 110
+        private static let stickyTileMaxAge: TimeInterval = 600
+        private static var fallbackGeneration: Int = 0
         private static let sourceTileCache: NSCache<NSString, NSData> = {
             let cache = NSCache<NSString, NSData>()
-            cache.countLimit = 2600
+            cache.countLimit = 3600
+            cache.totalCostLimit = 96 * 1024 * 1024
+            return cache
+        }()
+        private static let decodedSourceImageCache: NSCache<NSString, DecodedSourceImageBox> = {
+            let cache = NSCache<NSString, DecodedSourceImageBox>()
+            cache.countLimit = 1200
             cache.totalCostLimit = 64 * 1024 * 1024
             return cache
         }()
@@ -784,11 +979,21 @@ struct UIKitMap: UIViewRepresentable {
             cache.countLimit = 3000
             return cache
         }()
+        private static let clearTilePNGData: Data = {
+            let size = CGSize(width: 256, height: 256)
+            let renderer = UIGraphicsImageRenderer(size: size)
+            let image = renderer.image { context in
+                UIColor.clear.setFill()
+                context.fill(CGRect(origin: .zero, size: size))
+            }
+            return image.pngData() ?? Data()
+        }()
         private static let networkSession: URLSession = {
             let config = URLSessionConfiguration.default
-            config.httpMaximumConnectionsPerHost = 3
-            config.timeoutIntervalForRequest = 8
-            config.timeoutIntervalForResource = 12
+            // Keep parallelism moderate, but high enough for viewport bursts.
+            config.httpMaximumConnectionsPerHost = 8
+            config.timeoutIntervalForRequest = 15
+            config.timeoutIntervalForResource = 25
             config.waitsForConnectivity = false
             return URLSession(configuration: config)
         }()
@@ -797,7 +1002,18 @@ struct UIKitMap: UIViewRepresentable {
             qos: .utility
         )
         private static func shouldSample(_ path: MKTileOverlayPath) -> Bool {
-            ((path.x & 3) == 0) && ((path.y & 3) == 0)
+            guard debugLoggingEnabled else { return false }
+            return ((path.x & 7) == 0) && ((path.y & 7) == 0)
+        }
+        private static func shouldSampleStats(_ path: MKTileOverlayPath) -> Bool {
+            guard debugLoggingEnabled else { return false }
+            return ((path.x + path.y + path.z) & debugSampleMask) == 0
+        }
+        private static func shouldBypassClientRendering(_ template: String) -> Bool {
+            // Do not bypass client rendering for forecast backend tiles.
+            // Client-side rendering preserves weak/small precip fragments better.
+            _ = template
+            return false
         }
         nonisolated private static func templateDebugToken(_ template: String) -> String {
             let parts = template.split(separator: "/")
@@ -817,6 +1033,7 @@ struct UIKitMap: UIViewRepresentable {
             let normalizedMax = max(normalizedMin, maxSourceZ)
             self.template = urlTemplate
             self.fallbackTemplate = fallbackTemplate
+            self.fallbackTemplateSetAt = fallbackTemplate == nil ? 0 : Date().timeIntervalSince1970
             self.minSourceZ = normalizedMin
             self.maxSourceZ = normalizedMax
             super.init(urlTemplate: nil)
@@ -826,6 +1043,7 @@ struct UIKitMap: UIViewRepresentable {
             maximumZ = normalizedMax + overzoomLevels
             canReplaceMapContent = false
             isGeometryFlipped = false
+            Self.prewarmGlobalPreview(template: urlTemplate)
         }
 
         func updateSource(
@@ -842,7 +1060,11 @@ struct UIKitMap: UIViewRepresentable {
                     self.minSourceZ != normalizedMin ||
                     self.maxSourceZ != normalizedMax
                 {
+                    // Keep only the immediate previous frame as a soft fallback source.
+                    // It is used selectively (mainly medium zoom + failed/empty current tile)
+                    // to avoid large "holes" during rapid frame switches.
                     fallbackTemplate = template
+                    fallbackTemplateSetAt = Date().timeIntervalSince1970
                     template = urlTemplate
                     self.minSourceZ = normalizedMin
                     self.maxSourceZ = normalizedMax
@@ -851,7 +1073,11 @@ struct UIKitMap: UIViewRepresentable {
             }
 
             if changed {
+                // Keep fallback caches across adjacent forecast frames.
+                // This avoids full precipitation disappearance when a new frame
+                // has sparse/zero-visible tiles on high zoom while data loads.
                 maximumZ = normalizedMax + overzoomLevels
+                Self.prewarmGlobalPreview(template: urlTemplate)
             }
             return changed
         }
@@ -892,6 +1118,61 @@ struct UIKitMap: UIViewRepresentable {
             return false
         }
 
+        func sourceCoverageDescriptor() -> (
+            template: String,
+            minSourceZ: Int,
+            maxSourceZ: Int
+        ) {
+            let source = sourceSnapshot()
+            return (
+                template: source.template,
+                minSourceZ: source.minSourceZ,
+                maxSourceZ: source.maxSourceZ
+            )
+        }
+
+        static func hasSourceCacheCoverage(
+            template: String,
+            minSourceZ: Int,
+            maxSourceZ: Int,
+            requestedZoom: Int,
+            visibleTiles: [UIKitMap.VisibleTile],
+            minimumTiles: Int = 1
+        ) -> Bool {
+            guard requestedZoom >= 0, !visibleTiles.isEmpty else { return false }
+            let sourceZ = min(
+                max(requestedZoom, max(0, minSourceZ)),
+                max(max(0, minSourceZ), maxSourceZ)
+            )
+            let zoomDelta = max(0, requestedZoom - sourceZ)
+            let sourceN = 1 << sourceZ
+            guard sourceN > 0 else { return false }
+
+            var hits = 0
+            var seen = Set<UIKitMap.VisibleTile>()
+            for tile in visibleTiles.prefix(140) {
+                let sourceX = ((tile.x >> zoomDelta) % sourceN + sourceN) % sourceN
+                let sourceY = tile.y >> zoomDelta
+                guard sourceY >= 0, sourceY < sourceN else { continue }
+                let sourceTile = UIKitMap.VisibleTile(x: sourceX, y: sourceY)
+                if !seen.insert(sourceTile).inserted { continue }
+
+                guard let url = makeURLStatic(
+                    template: template,
+                    z: sourceZ,
+                    x: sourceX,
+                    y: sourceY
+                ) else {
+                    continue
+                }
+                if sourceTileCache.object(forKey: url.absoluteString as NSString) != nil {
+                    hits += 1
+                    if hits >= minimumTiles { return true }
+                }
+            }
+            return false
+        }
+
         static func prewarmTile(
             template: String,
             z: Int,
@@ -899,23 +1180,13 @@ struct UIKitMap: UIViewRepresentable {
             y: Int
         ) {
             guard let url = makeURLStatic(template: template, z: z, x: x, y: y) else { return }
-            let cacheKey = url.absoluteString as NSString
-            if sourceTileCache.object(forKey: cacheKey) != nil { return }
-
-            var request = URLRequest(url: url)
-            request.timeoutInterval = 7
-            request.setValue(userAgent, forHTTPHeaderField: "User-Agent")
-            request.setValue("image/png,image/*;q=0.9,*/*;q=0.5", forHTTPHeaderField: "Accept")
-
-            networkSession.dataTask(with: request) { data, response, _ in
-                let statusCode = (response as? HTTPURLResponse)?.statusCode ?? -1
-                guard statusCode == 200, let data, !data.isEmpty else { return }
-                sourceTileCache.setObject(
-                    data as NSData,
-                    forKey: cacheKey,
-                    cost: data.count
-                )
-            }.resume()
+            fetchSourceTile(
+                url: url,
+                timeout: 7,
+                z: z,
+                x: x,
+                y: y
+            ) { _, _, _ in }
         }
 
         static func hasSourceCoverage(
@@ -1083,11 +1354,13 @@ struct UIKitMap: UIViewRepresentable {
                     "fallback=\(source.fallbackTemplate.map(Self.templateDebugToken) ?? "nil")"
                 )
             }
-            loadTileDirect(
+            loadTileForSourceZ(
                 requested: tilePath,
                 sourceZ: sourceZ,
+                minSourceZ: source.minSourceZ,
                 template: source.template,
                 fallbackTemplate: source.fallbackTemplate,
+                retriesLeft: 1,
                 result: result
             )
         }
@@ -1100,7 +1373,11 @@ struct UIKitMap: UIViewRepresentable {
             result: @escaping (Data?, Error?) -> Void
         ) {
             let specificKey = Self.tileCacheKey(template: template, requested: requested)
-            if let cached = Self.renderedTileCache.object(forKey: specificKey as NSString) {
+            let bypass = Self.shouldBypassClientRendering(template)
+            let canReuseRenderedCache = !(bypass && sourceZ != requested.z)
+            if canReuseRenderedCache,
+               let cached = Self.renderedTileCache.object(forKey: specificKey as NSString)
+            {
                 let cachedData = cached as Data
                 if Self.cachedTileHasVisiblePixels(key: specificKey, data: cachedData) {
                     result(cachedData, nil)
@@ -1111,14 +1388,8 @@ struct UIKitMap: UIViewRepresentable {
             }
 
             let fallbackKey = Self.fallbackTileKey(template: template, requested: requested)
-            let genericKey = Self.genericTileKey(requested: requested)
-            let stickyKey = Self.stickyTileKey(requested: requested)
-            let previousSpecificKey = fallbackTemplate.map {
-                Self.tileCacheKey(template: $0, requested: requested)
-            }
-            let previousFallbackKey = fallbackTemplate.map {
-                Self.fallbackTileKey(template: $0, requested: requested)
-            }
+            let genericKey = Self.genericTileKey(template: template, requested: requested)
+            let stickyKey = Self.stickyTileKey(template: template, requested: requested)
             let resolveVisibleRenderedCache: (_ key: String, _ reason: String) -> (Data, String)? = { key, reason in
                 guard let cached = Self.renderedTileCache.object(forKey: key as NSString) else {
                     return nil
@@ -1129,27 +1400,48 @@ struct UIKitMap: UIViewRepresentable {
                 }
                 return (data, reason)
             }
+            let isMediumZoom = requested.z >= 4 && requested.z <= 8
+            let allowStickyFallback = !isMediumZoom && requested.z <= 7
+            let resolveStickyFallback: () -> (Data, String)? = {
+                if allowStickyFallback,
+                   let sticky = Self.freshStickyTile(key: stickyKey)
+                {
+                    return (sticky, "sticky")
+                }
+                return nil
+            }
+            let allowStickyCompositeFallback = !isMediumZoom && requested.z <= 7
             let resolveCachedFallback: () -> (Data, String)? = {
                 if let resolved = resolveVisibleRenderedCache(fallbackKey, "current-fallback") {
                     return resolved
                 }
-                if let resolved = resolveVisibleRenderedCache(genericKey, "generic") {
-                    return resolved
+                if let composite = self.childCompositeFallbackTile(
+                    template: template,
+                    requested: requested
+                ) {
+                    return (composite.data, "child-composite")
                 }
-                if let previousSpecificKey,
-                   let resolved = resolveVisibleRenderedCache(previousSpecificKey, "previous-specific")
+                if allowStickyCompositeFallback,
+                   let composite = self.childCompositeStickyFallbackTile(
+                    template: template,
+                    requested: requested
+                   )
                 {
-                    return resolved
+                    return (composite.data, "sticky-child-composite")
                 }
-                if let previousFallbackKey,
-                   let resolved = resolveVisibleRenderedCache(previousFallbackKey, "previous-fallback")
-                {
-                    return resolved
+                if let parent = self.parentFallbackTile(
+                    template: template,
+                    requested: requested
+                ) {
+                    return (parent, "parent-fallback")
                 }
-                if let sticky = Self.freshStickyTile(key: stickyKey) {
-                    return (sticky, "sticky")
+                if let preview = self.globalPreviewFallbackTile(
+                    template: template,
+                    requested: requested
+                ) {
+                    return (preview, "global-preview")
                 }
-                return nil
+                return resolveStickyFallback()
             }
 
             let zoomDelta = max(0, requested.z - sourceZ)
@@ -1160,7 +1452,7 @@ struct UIKitMap: UIViewRepresentable {
                     result(cached, nil)
                     return
                 }
-                result(nil, nil)
+                result(Self.clearTilePNGData, nil)
                 return
             }
 
@@ -1171,7 +1463,7 @@ struct UIKitMap: UIViewRepresentable {
                     result(cached, nil)
                     return
                 }
-                result(nil, nil)
+                result(Self.clearTilePNGData, nil)
                 return
             }
 
@@ -1189,17 +1481,95 @@ struct UIKitMap: UIViewRepresentable {
                         result(cached, nil)
                         return
                     }
-                    result(nil, error)
+                    result(Self.clearTilePNGData, nil)
                     return
                 }
 
-                guard let sourceImage = Self.decodeImage(data) else {
-                    result(nil, nil)
+                if bypass {
+                    if Self.isSuspiciousBypassSourceTile(data) {
+                        if Self.shouldSample(requested) {
+                            print("☁️ tile drop suspicious-source", "z=\(requested.z)", "x=\(requested.x)", "y=\(requested.y)", "bytes=\(data.count)")
+                        }
+                        result(Self.clearTilePNGData, nil)
+                        return
+                    }
+                    if sourceZ == requested.z {
+                        // Backend tiles are already styled; do not decode/re-encode or alpha-threshold.
+                        // Treat as visible to avoid "empty tile" misclassification at low zoom.
+                        Self.storeRenderedTile(
+                            data,
+                            specificKey: specificKey,
+                            fallbackKey: fallbackKey,
+                            genericKey: genericKey,
+                            stickyKey: stickyKey,
+                            visiblePixelCount: Self.minVisiblePixelsForGenericStore,
+                            storeAsGeneric: true
+                        )
+                        result(data, nil)
+                        return
+                    }
+                    let sourceImageKey = Self.sourceImageCacheKey(
+                        template: template,
+                        z: sourceZ,
+                        x: sourceX,
+                        y: sourceY
+                    )
+                    guard let sourceImage = Self.decodeSourceImage(
+                        data,
+                        cacheKey: sourceImageKey
+                    ) else {
+                        result(Self.clearTilePNGData, nil)
+                        return
+                    }
+                    let rendered = Self.cropAndScalePassthrough(
+                        sourceImage: sourceImage,
+                        requested: requested,
+                        sourceZ: sourceZ,
+                        targetSize: self.tileSize
+                    )
+                    guard let rendered else {
+                        result(Self.clearTilePNGData, nil)
+                        return
+                    }
+                    // Do not persist overzoom-rendered tiles for bypass templates:
+                    // stale center fragments can survive quick zoom/time switches.
+                    Self.logTileStats(rendered.data, label: "raw-crop", path: requested)
+                    result(rendered.data, nil)
                     return
                 }
 
+                let sourceImageKey = Self.sourceImageCacheKey(
+                    template: template,
+                    z: sourceZ,
+                    x: sourceX,
+                    y: sourceY
+                )
+                guard let sourceImage = Self.decodeSourceImage(
+                    data,
+                    cacheKey: sourceImageKey
+                ) else {
+                    result(Self.clearTilePNGData, nil)
+                    return
+                }
+
+                let preserveWeakSignal = requested.z <= 8 || sourceZ <= 6 || requested.z >= 9
                 let rendered: RenderedTile?
-                if Self.useRawRendering {
+                if preserveWeakSignal {
+                    if sourceZ == requested.z {
+                        rendered = Self.renderPassthroughTile(
+                            image: sourceImage,
+                            targetSize: CGSize(width: sourceImage.width, height: sourceImage.height),
+                            interpolation: .none
+                        )
+                    } else {
+                        rendered = Self.cropAndScalePassthrough(
+                            sourceImage: sourceImage,
+                            requested: requested,
+                            sourceZ: sourceZ,
+                            targetSize: self.tileSize
+                        )
+                    }
+                } else if Self.useRawRendering {
                     if sourceZ == requested.z {
                         rendered = Self.renderRawTile(
                             image: sourceImage,
@@ -1241,19 +1611,32 @@ struct UIKitMap: UIViewRepresentable {
                         result(cached, nil)
                         return
                     }
-                    result(nil, nil)
+                    result(Self.clearTilePNGData, nil)
                     return
                 }
 
                 guard rendered.visiblePixelCount >= Self.minVisiblePixelsForGenericFallback else {
                     if let (cached, reason) = resolveCachedFallback() {
                         if Self.shouldSample(requested) {
-                            print("☁️ tile fallback:", reason, "reason:low-visible")
+                            print("☁️ tile fallback:", reason, "reason:low-visible-drop \(rendered.visiblePixelCount)")
                         }
                         result(cached, nil)
                         return
                     }
-                    result(nil, nil)
+                    if allowStickyFallback,
+                       let sticky = Self.freshStickyTile(key: stickyKey)
+                    {
+                        if Self.shouldSample(requested) {
+                            print("☁️ tile fallback: sticky reason:low-visible-drop \(rendered.visiblePixelCount)")
+                        }
+                        result(sticky, nil)
+                        return
+                    }
+                    if Self.shouldSample(requested) {
+                        print("☁️ tile hold reason:low-visible-drop \(rendered.visiblePixelCount)")
+                    }
+                    // Keep previous map content instead of caching a near-empty tile.
+                    result(Self.clearTilePNGData, nil)
                     return
                 }
 
@@ -1264,7 +1647,7 @@ struct UIKitMap: UIViewRepresentable {
                     genericKey: genericKey,
                     stickyKey: stickyKey,
                     visiblePixelCount: rendered.visiblePixelCount,
-                    storeAsGeneric: true
+                    storeAsGeneric: rendered.visiblePixelCount >= Self.minVisiblePixelsForGenericStore
                 )
                 result(rendered.data, nil)
             }
@@ -1281,20 +1664,16 @@ struct UIKitMap: UIViewRepresentable {
         ) {
             let specificKey = Self.tileCacheKey(template: template, requested: requested)
             let fallbackKey = Self.fallbackTileKey(template: template, requested: requested)
-            let genericKey = Self.genericTileKey(requested: requested)
-            let stickyKey = Self.stickyTileKey(requested: requested)
-            let previousSpecificKey = fallbackTemplate.map {
-                Self.tileCacheKey(template: $0, requested: requested)
-            }
-            let previousFallbackKey = fallbackTemplate.map {
-                Self.fallbackTileKey(template: $0, requested: requested)
-            }
+            let genericKey = Self.genericTileKey(template: template, requested: requested)
+            let stickyKey = Self.stickyTileKey(template: template, requested: requested)
+            let bypass = Self.shouldBypassClientRendering(template)
+            let canReuseRenderedCache = !(bypass && sourceZ != requested.z)
             let resolveVisibleRenderedCache: (_ key: String, _ reason: String) -> (Data, String)? = { key, reason in
                 guard let cached = Self.renderedTileCache.object(forKey: key as NSString) else {
                     return nil
                 }
                 let data = cached as Data
-                guard Self.cachedTileHasVisiblePixels(key: key, data: data) else {
+                guard bypass || Self.cachedTileHasVisiblePixels(key: key, data: data) else {
                     if Self.shouldSample(requested) {
                         print("☁️DBG fallback reject invisible", reason)
                     }
@@ -1302,40 +1681,95 @@ struct UIKitMap: UIViewRepresentable {
                 }
                 return (data, reason)
             }
+            let isMediumZoom = requested.z >= 4 && requested.z <= 8
+            let allowGenericFallback = !isMediumZoom && requested.z <= 8
+            let allowStickyCompositeFallback = !isMediumZoom && requested.z <= 7
+            let allowStickyFallback = !isMediumZoom && requested.z <= 7
             let resolveCachedFallback: () -> (Data, String)? = {
                 if let resolved = resolveVisibleRenderedCache(fallbackKey, "current-fallback") {
                     return resolved
                 }
-                if let resolved = resolveVisibleRenderedCache(genericKey, "generic") {
-                    return resolved
-                }
-                if let previousSpecificKey,
-                   let resolved = resolveVisibleRenderedCache(previousSpecificKey, "previous-specific")
+                if allowGenericFallback,
+                   let resolved = resolveVisibleRenderedCache(genericKey, "generic")
                 {
                     return resolved
                 }
-                if let previousFallbackKey,
-                   let resolved = resolveVisibleRenderedCache(previousFallbackKey, "previous-fallback")
-                {
-                    return resolved
+                if let composite = self.childCompositeFallbackTile(
+                    template: template,
+                    requested: requested
+                ) {
+                    return (composite.data, "child-composite")
                 }
-                if let sticky = Self.freshStickyTile(key: stickyKey) {
+                if allowStickyCompositeFallback,
+                   let composite = self.childCompositeStickyFallbackTile(
+                    template: template,
+                    requested: requested
+                   )
+                {
+                    return (composite.data, "sticky-child-composite")
+                }
+                if let parent = self.parentFallbackTile(
+                    template: template,
+                    requested: requested
+                ) {
+                    return (parent, "parent-fallback")
+                }
+                if let preview = self.globalPreviewFallbackTile(
+                    template: template,
+                    requested: requested
+                ) {
+                    return (preview, "global-preview")
+                }
+                if allowStickyFallback,
+                   let sticky = Self.freshStickyTile(key: stickyKey)
+                {
                     return (sticky, "sticky")
                 }
                 return nil
             }
-            if let cached = Self.renderedTileCache.object(forKey: specificKey as NSString) {
-                if Self.shouldSample(requested) {
-                    print(
-                        "☁️ tile cache-hit:",
-                        Self.templateDebugToken(template),
-                        "z=\(requested.z)",
-                        "x=\(requested.x)",
-                        "y=\(requested.y)"
-                    )
+            if canReuseRenderedCache,
+               let cached = Self.renderedTileCache.object(forKey: specificKey as NSString)
+            {
+                let cachedData = cached as Data
+                if bypass {
+                    if Self.shouldSample(requested) {
+                        print(
+                            "☁️ tile cache-hit:",
+                            Self.templateDebugToken(template),
+                            "z=\(requested.z)",
+                            "x=\(requested.x)",
+                            "y=\(requested.y)",
+                            "bypass=1"
+                        )
+                    }
+                    result(cachedData, nil)
+                    return
                 }
-                result(cached as Data, nil)
-                return
+                if Self.cachedTileHasVisiblePixels(key: specificKey, data: cachedData) {
+                    if Self.shouldSample(requested) {
+                        print(
+                            "☁️ tile cache-hit:",
+                            Self.templateDebugToken(template),
+                            "z=\(requested.z)",
+                            "x=\(requested.x)",
+                            "y=\(requested.y)"
+                        )
+                    }
+                    result(cachedData, nil)
+                    return
+                }
+                // Cached tile exists but effectively empty: prefer visible fallback
+                // to avoid blink holes during zoom/pan.
+                if let (fallback, reason) = resolveCachedFallback() {
+                    if Self.shouldSample(requested) {
+                        print("☁️ tile fallback:", reason, "reason:empty-cache-hit")
+                    }
+                    result(fallback, nil)
+                    return
+                }
+                // Empty cached tile must not be emitted, otherwise map briefly flashes blank.
+                Self.renderedTileCache.removeObject(forKey: specificKey as NSString)
+                Self.renderedVisiblePixelCache.removeObject(forKey: specificKey as NSString)
             }
 
             let zoomDelta = max(0, requested.z - sourceZ)
@@ -1343,10 +1777,12 @@ struct UIKitMap: UIViewRepresentable {
             let sourceN = 1 << sourceZ
             guard sourceN > 0 else {
                 if let (cached, reason) = resolveCachedFallback() {
-                    print("☁️ tile fallback:", reason, "reason:invalid-sourceN")
+                    if Self.shouldSample(requested) {
+                        print("☁️ tile fallback:", reason, "reason:invalid-sourceN")
+                    }
                     result(cached, nil)
                 } else {
-                    result(nil, nil)
+                    result(Self.clearTilePNGData, nil)
                 }
                 return
             }
@@ -1354,105 +1790,32 @@ struct UIKitMap: UIViewRepresentable {
             let sourceY = requested.y / scale
             guard sourceY >= 0, sourceY < sourceN else {
                 if let (cached, reason) = resolveCachedFallback() {
-                    print("☁️ tile fallback:", reason, "reason:out-of-range-y", "z=\(requested.z)", "x=\(requested.x)", "y=\(requested.y)")
+                    if Self.shouldSample(requested) {
+                        print("☁️ tile fallback:", reason, "reason:out-of-range-y", "z=\(requested.z)", "x=\(requested.x)", "y=\(requested.y)")
+                    }
                     result(cached, nil)
                 } else {
-                    result(nil, nil)
+                    result(Self.clearTilePNGData, nil)
                 }
                 return
             }
 
-            // Critical path for scrubbing: if the incoming frame source tile is not yet cached,
-            // render immediately from previous frame's cached source tile (same z/x/y),
-            // then warm current source in background.
-            if let fallbackTemplate,
-               let currentURL = Self.makeURLStatic(template: template, z: sourceZ, x: sourceX, y: sourceY),
-               Self.sourceTileCache.object(forKey: currentURL.absoluteString as NSString) == nil,
-               let previousURL = Self.makeURLStatic(template: fallbackTemplate, z: sourceZ, x: sourceX, y: sourceY),
-               let previousSourceData = Self.sourceTileCache.object(forKey: previousURL.absoluteString as NSString) as Data?,
-               let previousImage = Self.decodeImage(previousSourceData)
+            // Hotfix: 2026-03-03 06:00 frame has recurring corrupted blocks around Birmingham
+            // on multiple source zooms. Prefer stable lower source zoom in this bbox.
+            if template.contains("/202603030600/"),
+               sourceZ > 4,
+               Self.isBirminghamBBox(sourceZ: sourceZ, sourceX: sourceX, sourceY: sourceY)
             {
-                let immediateRendered: RenderedTile?
-                if sourceZ == requested.z {
-                    immediateRendered = Self.maskAndEncodeForecastTile(
-                        image: previousImage,
-                        targetSize: CGSize(
-                            width: previousImage.width,
-                            height: previousImage.height
-                        ),
-                        interpolation: .none,
-                        edgeSmoothingPasses: 0,
-                        tileEdgeFeatherWidth: 0
-                    )
-                } else {
-                    immediateRendered = Self.cropAndScale(
-                        sourceImage: previousImage,
-                        requested: requested,
-                        sourceZ: sourceZ,
-                        targetSize: self.tileSize
-                    )
-                }
-
-                if let immediateRendered,
-                   immediateRendered.visiblePixelCount >= Self.minVisiblePixelsForGenericFallback
-                {
-                    Self.storeRenderedTile(
-                        immediateRendered.data,
-                        specificKey: specificKey,
-                        fallbackKey: fallbackKey,
-                        genericKey: genericKey,
-                        stickyKey: stickyKey,
-                        visiblePixelCount: immediateRendered.visiblePixelCount,
-                        storeAsGeneric: false
-                    )
-                    if Self.shouldSample(requested) {
-                        print(
-                            "☁️ tile immediate previous-source:",
-                            "z=\(requested.z)",
-                            "x=\(requested.x)",
-                            "y=\(requested.y)",
-                            "from=\(Self.templateDebugToken(fallbackTemplate))",
-                            "to=\(Self.templateDebugToken(template))"
-                        )
-                    }
-
-                    fetchTile(
-                        template: template,
-                        z: sourceZ,
-                        x: sourceX,
-                        y: sourceY
-                    ) { _, _, _ in }
-
-                    result(immediateRendered.data, nil)
-                    return
-                }
-            }
-            if Self.shouldSample(requested),
-               let fallbackTemplate,
-               let currentURL = Self.makeURLStatic(template: template, z: sourceZ, x: sourceX, y: sourceY)
-            {
-                let currentCached = Self.sourceTileCache.object(forKey: currentURL.absoluteString as NSString) != nil
-                if !currentCached {
-                    let previousCached: Bool = {
-                        guard let previousURL = Self.makeURLStatic(template: fallbackTemplate, z: sourceZ, x: sourceX, y: sourceY) else {
-                            return false
-                        }
-                        return Self.sourceTileCache.object(forKey: previousURL.absoluteString as NSString) != nil
-                    }()
-                    if !previousCached {
-                        print(
-                            "☁️DBG immediate-fallback miss prev-source",
-                            "reqZ=\(requested.z)",
-                            "reqX=\(requested.x)",
-                            "reqY=\(requested.y)",
-                            "srcZ=\(sourceZ)",
-                            "srcX=\(sourceX)",
-                            "srcY=\(sourceY)",
-                            "template=\(Self.templateDebugToken(template))",
-                            "fallback=\(Self.templateDebugToken(fallbackTemplate))"
-                        )
-                    }
-                }
+                self.loadTileForSourceZ(
+                    requested: requested,
+                    sourceZ: sourceZ - 1,
+                    minSourceZ: minSourceZ,
+                    template: template,
+                    fallbackTemplate: fallbackTemplate,
+                    retriesLeft: retriesLeft,
+                    result: result
+                )
+                return
             }
 
             fetchTile(
@@ -1462,21 +1825,6 @@ struct UIKitMap: UIViewRepresentable {
                 y: sourceY
             ) { data, statusCode, error in
                 if statusCode != 200 || data == nil || data?.isEmpty == true {
-                    // Overzoom fallback only for explicit tile-unavailable statuses.
-                    let canFallback = (statusCode == 403 || statusCode == 404 || statusCode == 410)
-                    if canFallback && sourceZ > minSourceZ {
-                        self.loadTileForSourceZ(
-                            requested: requested,
-                            sourceZ: sourceZ - 1,
-                            minSourceZ: minSourceZ,
-                            template: template,
-                            fallbackTemplate: fallbackTemplate,
-                            retriesLeft: retriesLeft,
-                            result: result
-                        )
-                        return
-                    }
-
                     // Retry once on transient network errors to reduce tile-edge holes.
                     if statusCode == -1, retriesLeft > 0 {
                         self.loadTileForSourceZ(
@@ -1486,6 +1834,22 @@ struct UIKitMap: UIViewRepresentable {
                             template: template,
                             fallbackTemplate: fallbackTemplate,
                             retriesLeft: retriesLeft - 1,
+                            result: result
+                        )
+                        return
+                    }
+
+                    // Avoid deep fallback cascades on generic backend errors/timeouts.
+                    // Step down only for explicit not-found responses.
+                    let canFallback = (statusCode == 404) && (sourceZ > minSourceZ)
+                    if canFallback {
+                        self.loadTileForSourceZ(
+                            requested: requested,
+                            sourceZ: sourceZ - 1,
+                            minSourceZ: minSourceZ,
+                            template: template,
+                            fallbackTemplate: fallbackTemplate,
+                            retriesLeft: retriesLeft,
                             result: result
                         )
                         return
@@ -1507,7 +1871,7 @@ struct UIKitMap: UIViewRepresentable {
                         result(cached, nil)
                         return
                     }
-                    result(nil, error)
+                    result(Self.clearTilePNGData, nil)
                     return
                 }
 
@@ -1519,11 +1883,121 @@ struct UIKitMap: UIViewRepresentable {
                         result(cached, nil)
                         return
                     }
-                    result(nil, error)
+                    result(Self.clearTilePNGData, nil)
                     return
                 }
 
-                guard let sourceImage = Self.decodeImage(data) else {
+                if Self.shouldBypassClientRendering(template) {
+                    if Self.shouldAvoidKnownStuckSourceTile(
+                        template: template,
+                        z: sourceZ,
+                        x: sourceX,
+                        y: sourceY,
+                        data: data
+                    ) {
+                        if sourceZ > minSourceZ {
+                            if Self.shouldSample(requested) {
+                                print(
+                                    "☁️ tile downgrade known-stuck-source",
+                                    "req-z=\(requested.z)",
+                                    "req-x=\(requested.x)",
+                                    "req-y=\(requested.y)",
+                                    "src-z=\(sourceZ)",
+                                    "src-x=\(sourceX)",
+                                    "src-y=\(sourceY)"
+                                )
+                            }
+                            self.loadTileForSourceZ(
+                                requested: requested,
+                                sourceZ: sourceZ - 1,
+                                minSourceZ: minSourceZ,
+                                template: template,
+                                fallbackTemplate: fallbackTemplate,
+                                retriesLeft: retriesLeft,
+                                result: result
+                            )
+                            return
+                        }
+                        result(Self.clearTilePNGData, nil)
+                        return
+                    }
+                    if Self.isSuspiciousBypassSourceTile(data) {
+                        if Self.shouldSample(requested) {
+                            print("☁️ tile drop suspicious-source", "z=\(requested.z)", "x=\(requested.x)", "y=\(requested.y)", "bytes=\(data.count)")
+                        }
+                        result(Self.clearTilePNGData, nil)
+                        return
+                    }
+                    if sourceZ == requested.z {
+                        // Backend tiles are already styled; do not decode/re-encode or alpha-threshold.
+                        // Treat as visible to avoid "empty tile" misclassification at low zoom.
+                        Self.storeRenderedTile(
+                            data,
+                            specificKey: specificKey,
+                            fallbackKey: fallbackKey,
+                            genericKey: genericKey,
+                            stickyKey: stickyKey,
+                            visiblePixelCount: Self.minVisiblePixelsForGenericStore,
+                            storeAsGeneric: true
+                        )
+                        result(data, nil)
+                        return
+                    }
+                    let sourceImageKey = Self.sourceImageCacheKey(
+                        template: template,
+                        z: sourceZ,
+                        x: sourceX,
+                        y: sourceY
+                    )
+                    guard let sourceImage = Self.decodeSourceImage(
+                        data,
+                        cacheKey: sourceImageKey
+                    ) else {
+                        if let (cached, reason) = resolveCachedFallback() {
+                            if Self.shouldSample(requested) {
+                                print("☁️ tile fallback:", reason, "reason:decode-failed")
+                            }
+                            result(cached, nil)
+                            return
+                        }
+                        result(Self.clearTilePNGData, nil)
+                        return
+                    }
+                    let rendered = Self.cropAndScalePassthrough(
+                        sourceImage: sourceImage,
+                        requested: requested,
+                        sourceZ: sourceZ,
+                        targetSize: self.tileSize
+                    )
+                    guard let rendered else {
+                        if let (cached, reason) = resolveCachedFallback() {
+                            if Self.shouldSample(requested) {
+                                print("☁️ tile fallback:", reason, "reason:render-nil")
+                            }
+                            result(cached, nil)
+                            return
+                        }
+                        result(Self.clearTilePNGData, nil)
+                        return
+                    }
+                    // For bypass templates, even a fully transparent tile is a valid/stable result.
+                    // Mark it as visible so it can be reused as fallback and does not cause refetch churn.
+                    // Do not cache overzoom-rendered bypass tiles. Keep source-tile cache only.
+                    Self.logTileStats(rendered.data, label: "raw-crop", path: requested)
+                    result(rendered.data, nil)
+                    return
+                }
+
+                let sourceImageKey = Self.sourceImageCacheKey(
+                    template: template,
+                    z: sourceZ,
+                    x: sourceX,
+                    y: sourceY
+                )
+                guard let sourceImage = Self.decodeSourceImage(
+                    data,
+                    cacheKey: sourceImageKey
+                ) else {
                     if let (cached, reason) = resolveCachedFallback() {
                         if Self.shouldSample(requested) {
                             print("☁️ tile fallback:", reason, "reason:decode-failed")
@@ -1531,13 +2005,23 @@ struct UIKitMap: UIViewRepresentable {
                         result(cached, nil)
                         return
                     }
-                    result(nil, error)
+                    result(Self.clearTilePNGData, nil)
                     return
                 }
 
+                let preserveWeakSignal = requested.z <= 8 || sourceZ <= 6 || requested.z >= 9
                 if sourceZ == requested.z {
                     let rendered: RenderedTile?
-                    if Self.useRawRendering {
+                    if preserveWeakSignal {
+                        rendered = Self.renderPassthroughTile(
+                            image: sourceImage,
+                            targetSize: CGSize(
+                                width: sourceImage.width,
+                                height: sourceImage.height
+                            ),
+                            interpolation: .none
+                        )
+                    } else if Self.useRawRendering {
                         rendered = Self.renderRawTile(
                             image: sourceImage,
                             targetSize: CGSize(
@@ -1566,7 +2050,7 @@ struct UIKitMap: UIViewRepresentable {
                             result(cached, nil)
                             return
                         }
-                        result(nil, error)
+                        result(Self.clearTilePNGData, nil)
                         return
                     }
 
@@ -1596,7 +2080,7 @@ struct UIKitMap: UIViewRepresentable {
                         genericKey: genericKey,
                         stickyKey: stickyKey,
                         visiblePixelCount: rendered.visiblePixelCount,
-                        storeAsGeneric: rendered.visiblePixelCount >= Self.minVisiblePixelsForGenericFallback
+                        storeAsGeneric: rendered.visiblePixelCount >= Self.minVisiblePixelsForGenericStore
                     )
                     if Self.shouldSample(requested) {
                         print(
@@ -1613,7 +2097,14 @@ struct UIKitMap: UIViewRepresentable {
                 }
 
                 let rendered: RenderedTile?
-                if Self.useRawRendering {
+                if preserveWeakSignal {
+                    rendered = Self.cropAndScalePassthrough(
+                        sourceImage: sourceImage,
+                        requested: requested,
+                        sourceZ: sourceZ,
+                        targetSize: self.tileSize
+                    )
+                } else if Self.useRawRendering {
                     rendered = Self.cropAndScaleRaw(
                         sourceImage: sourceImage,
                         requested: requested,
@@ -1636,7 +2127,7 @@ struct UIKitMap: UIViewRepresentable {
                         result(cached, nil)
                         return
                     }
-                    result(nil, error)
+                    result(Self.clearTilePNGData, nil)
                     return
                 }
 
@@ -1666,7 +2157,7 @@ struct UIKitMap: UIViewRepresentable {
                     genericKey: genericKey,
                     stickyKey: stickyKey,
                     visiblePixelCount: rendered.visiblePixelCount,
-                    storeAsGeneric: rendered.visiblePixelCount >= Self.minVisiblePixelsForGenericFallback
+                    storeAsGeneric: rendered.visiblePixelCount >= Self.minVisiblePixelsForGenericStore
                 )
                 if Self.shouldSample(requested) {
                     print(
@@ -1698,110 +2189,50 @@ struct UIKitMap: UIViewRepresentable {
             resolveCachedFallback: @escaping () -> (Data, String)?,
             result: @escaping (Data?, Error?) -> Void
         ) {
-            if let cached = Self.renderedTileCache.object(forKey: genericKey as NSString) {
-                if Self.shouldSample(requested) {
-                    print("☁️ tile fallback: generic reason:low-visible", rendered.visiblePixelCount)
-                }
-                result(cached as Data, nil)
-                return
-            }
-            if let (cached, reason) = resolveCachedFallback() {
-                if Self.shouldSample(requested) {
-                    print("☁️ tile fallback:", reason, "reason:low-visible", rendered.visiblePixelCount)
-                }
-                result(cached, nil)
-                return
-            }
-            guard let fallbackTemplate else {
-                result(rendered.data, nil)
-                return
-            }
+            _ = sourceZ
+            _ = sourceX
+            _ = sourceY
+            _ = template
+            _ = fallbackTemplate
 
-            fetchTile(
-                template: fallbackTemplate,
-                z: sourceZ,
-                x: sourceX,
-                y: sourceY
-            ) { fallbackData, fallbackStatus, _ in
-                guard fallbackStatus == 200,
-                      let fallbackData,
-                      let fallbackImage = Self.decodeImage(fallbackData)
-                else {
-                    result(rendered.data, nil)
+            // Do not cache low-visible tiles into current fallback keys; this causes
+            // persistent "holes" on overzoom when a sparse tile overwrites good cache.
+
+            // Important: do not "hold" old cached tile for low-visible results.
+            // Holding old content causes persistent frozen cloud fragments.
+
+            if rendered.visiblePixelCount == 0 {
+                if let (cached, reason) = resolveCachedFallback() {
+                    if Self.shouldSample(requested) {
+                        print("☁️ tile zero-visible: fallback \(reason)")
+                    }
+                    result(cached, nil)
                     return
                 }
-
-                let fallbackRendered: RenderedTile?
-                if sourceZ == requested.z {
-                    if Self.useRawRendering {
-                        fallbackRendered = Self.renderRawTile(
-                            image: fallbackImage,
-                            targetSize: CGSize(
-                                width: fallbackImage.width,
-                                height: fallbackImage.height
-                            ),
-                            interpolation: .none
-                        )
-                    } else {
-                        fallbackRendered = Self.maskAndEncodeForecastTile(
-                            image: fallbackImage,
-                            targetSize: CGSize(
-                                width: fallbackImage.width,
-                                height: fallbackImage.height
-                            ),
-                            interpolation: .none,
-                            edgeSmoothingPasses: 0,
-                            tileEdgeFeatherWidth: 0
-                        )
-                    }
-                } else {
-                    if Self.useRawRendering {
-                        fallbackRendered = Self.cropAndScaleRaw(
-                            sourceImage: fallbackImage,
-                            requested: requested,
-                            sourceZ: sourceZ,
-                            targetSize: self.tileSize
-                        )
-                    } else {
-                        fallbackRendered = Self.cropAndScale(
-                            sourceImage: fallbackImage,
-                            requested: requested,
-                            sourceZ: sourceZ,
-                            targetSize: self.tileSize
-                        )
-                    }
-                }
-
-                guard
-                    let fallbackRendered,
-                    fallbackRendered.visiblePixelCount >= Self.minVisiblePixelsForGenericFallback
-                else {
-                    result(rendered.data, nil)
-                    return
-                }
-
-                Self.storeRenderedTile(
-                    fallbackRendered.data,
-                    specificKey: specificKey,
-                    fallbackKey: fallbackKey,
-                    genericKey: genericKey,
-                    stickyKey: stickyKey,
-                    visiblePixelCount: fallbackRendered.visiblePixelCount,
-                    storeAsGeneric: true
-                )
-
                 if Self.shouldSample(requested) {
-                    print(
-                        "☁️ tile fallback: previous-source",
-                        "req-z=\(requested.z)",
-                        "req-x=\(requested.x)",
-                        "req-y=\(requested.y)",
-                        "from=\(Self.templateDebugToken(template))",
-                        "prev=\(Self.templateDebugToken(fallbackTemplate))"
-                    )
+                    print("☁️ tile zero-visible: clear-current")
                 }
-                result(fallbackRendered.data, nil)
+                // Do not overwrite cache with transparent tile: it causes long "disappear"
+                // periods on watch/iPhone until another successful tile arrives.
+                result(Self.clearTilePNGData, nil)
+                return
             }
+
+            // Only now store the tile, when we decided it is acceptable to display.
+            Self.storeRenderedTile(
+                rendered.data,
+                specificKey: specificKey,
+                fallbackKey: fallbackKey,
+                genericKey: genericKey,
+                stickyKey: stickyKey,
+                visiblePixelCount: rendered.visiblePixelCount,
+                storeAsGeneric: false
+            )
+
+            if Self.shouldSample(requested) {
+                print("☁️ tile keep current low-visible:", rendered.visiblePixelCount)
+            }
+            result(rendered.data, nil)
         }
 
         private func fetchTile(
@@ -1815,9 +2246,321 @@ struct UIKitMap: UIViewRepresentable {
                 completion(nil, -1, nil)
                 return
             }
+            Self.fetchSourceTile(
+                url: url,
+                timeout: 6,
+                z: z,
+                x: x,
+                y: y,
+                completion: completion
+            )
+        }
+
+        private static func prewarmGlobalPreview(template: String) {
+            guard let url = makeURLStatic(template: template, z: 0, x: 0, y: 0) else { return }
+            fetchSourceTile(
+                url: url,
+                timeout: 8,
+                z: 0,
+                x: 0,
+                y: 0
+            ) { _, _, _ in }
+        }
+
+        private func globalPreviewFallbackTile(
+            template: String,
+            requested: MKTileOverlayPath
+        ) -> Data? {
+            guard let url = Self.makeURLStatic(template: template, z: 0, x: 0, y: 0) else {
+                return nil
+            }
+            let sourceKey = url.absoluteString as NSString
+            guard let source = Self.sourceTileCache.object(forKey: sourceKey) else {
+                return nil
+            }
+            let sourceData = source as Data
+            let sourceImageKey = Self.sourceImageCacheKey(template: template, z: 0, x: 0, y: 0)
+            guard let sourceImage = Self.decodeSourceImage(sourceData, cacheKey: sourceImageKey) else {
+                return nil
+            }
+            return Self.cropAndScalePassthrough(
+                sourceImage: sourceImage,
+                requested: requested,
+                sourceZ: 0,
+                targetSize: self.tileSize
+            )?.data
+        }
+
+        private func parentFallbackTile(
+            template: String,
+            requested: MKTileOverlayPath,
+            maxDepth: Int = 2
+        ) -> Data? {
+            guard requested.z > 0 else { return nil }
+            for depth in 1...maxDepth {
+                let parentZ = requested.z - depth
+                if parentZ < 0 { break }
+                let scale = 1 << depth
+                let parentX = requested.x / scale
+                let parentY = requested.y / scale
+
+                if let url = Self.makeURLStatic(
+                    template: template,
+                    z: parentZ,
+                    x: parentX,
+                    y: parentY
+                ) {
+                    let key = url.absoluteString as NSString
+                    if let cached = Self.sourceTileCache.object(forKey: key) {
+                        let data = cached as Data
+                        if let sourceImage = Self.decodeSourceImage(
+                            data,
+                            cacheKey: "\(key)|decoded"
+                        ) {
+                            if let rendered = Self.cropAndScalePassthrough(
+                                sourceImage: sourceImage,
+                                requested: requested,
+                                sourceZ: parentZ,
+                                targetSize: self.tileSize
+                            ) {
+                                return rendered.data
+                            }
+                        }
+                    }
+                }
+            }
+            return nil
+        }
+
+        private func childCompositeFallbackTile(
+            template: String,
+            requested: MKTileOverlayPath,
+            maxDepth: Int = 2
+        ) -> RenderedTile? {
+            // Zoom-out fallback: synthesize a low-zoom tile from cached higher-zoom rendered children.
+            // This avoids "blink holes" while waiting for network/source render on zoom-out.
+            guard requested.z >= 0, requested.z < 19 else { return nil }
+
+            let allowEmpty = Self.shouldBypassClientRendering(template)
+            for depth in 1...maxDepth {
+                let childZ = requested.z + depth
+                if childZ > 20 { break }
+                let scale = 1 << depth
+                let childTileSide = 256 / scale
+                if childTileSide <= 0 { break }
+
+                // On zoom-out, require only one visible child tile to synthesize a parent fallback.
+                // This avoids empty/flickering sectors when cloud coverage is sparse.
+                let requiredChildren = 1
+                var childImages: [(image: CGImage, dx: Int, dy: Int)] = []
+                childImages.reserveCapacity(scale * scale)
+
+                for dy in 0..<scale {
+                    for dx in 0..<scale {
+                        let childPath = MKTileOverlayPath(
+                            x: requested.x * scale + dx,
+                            y: requested.y * scale + dy,
+                            z: childZ,
+                            contentScaleFactor: 1.0
+                        )
+                        let childKey = Self.tileCacheKey(template: template, requested: childPath)
+                        guard let cached = Self.renderedTileCache.object(forKey: childKey as NSString) else {
+                            continue
+                        }
+                        let data = cached as Data
+                        guard allowEmpty || Self.cachedTileHasVisiblePixels(key: childKey, data: data) else {
+                            continue
+                        }
+                        guard let image = Self.decodeImage(data) else { continue }
+                        childImages.append((image: image, dx: dx, dy: dy))
+                    }
+                }
+
+                guard childImages.count >= requiredChildren else { continue }
+
+                let width = 256
+                let height = 256
+                let bitmapInfo =
+                    CGImageAlphaInfo.premultipliedLast.rawValue |
+                    CGBitmapInfo.byteOrder32Big.rawValue
+                guard let context = CGContext(
+                    data: nil,
+                    width: width,
+                    height: height,
+                    bitsPerComponent: 8,
+                    bytesPerRow: 0,
+                    space: CGColorSpaceCreateDeviceRGB(),
+                    bitmapInfo: bitmapInfo
+                ) else {
+                    return nil
+                }
+
+                context.interpolationQuality = .high
+                context.setShouldAntialias(false)
+                context.clear(CGRect(x: 0, y: 0, width: width, height: height))
+
+                for child in childImages {
+                    let rect = CGRect(
+                        x: child.dx * childTileSide,
+                        y: child.dy * childTileSide,
+                        width: childTileSide,
+                        height: childTileSide
+                    )
+                    context.draw(child.image, in: rect)
+                }
+
+                guard let bytes = context.data else { return nil }
+                let ptr = bytes.bindMemory(to: UInt8.self, capacity: width * height * 4)
+                let count = width * height
+                var visible = 0
+                // Fast-ish scan: stop once we know it's non-empty enough.
+                for i in stride(from: 0, to: count, by: 29) {
+                    if ptr[i * 4 + 3] >= 3 {
+                        visible += 1
+                        if visible >= Self.minVisiblePixelsForGenericStore { break }
+                    }
+                }
+                guard visible >= Self.minVisiblePixelsForGenericFallback else { continue }
+                guard let outputImage = context.makeImage() else { return nil }
+
+                let output = NSMutableData()
+                guard let destination = CGImageDestinationCreateWithData(
+                    output,
+                    UTType.png.identifier as CFString,
+                    1,
+                    nil
+                ) else {
+                    return nil
+                }
+                CGImageDestinationAddImage(destination, outputImage, nil)
+                guard CGImageDestinationFinalize(destination) else { return nil }
+
+                return RenderedTile(
+                    data: output as Data,
+                    visiblePixelCount: max(visible, Self.minVisiblePixelsForGenericStore)
+                )
+            }
+
+            return nil
+        }
+
+        private func childCompositeStickyFallbackTile(
+            template: String,
+            requested: MKTileOverlayPath,
+            maxDepth: Int = 2
+        ) -> RenderedTile? {
+            // Template-agnostic zoom-out hold:
+            // if current template has no fallback chain yet, synthesize a parent
+            // tile from recent sticky children at higher zoom.
+            guard requested.z >= 0, requested.z < 19 else { return nil }
+
+            for depth in 1...maxDepth {
+                let childZ = requested.z + depth
+                if childZ > 20 { break }
+                let scale = 1 << depth
+                let childTileSide = 256 / scale
+                if childTileSide <= 0 { break }
+
+                let requiredChildren = 1
+                var childImages: [(image: CGImage, dx: Int, dy: Int)] = []
+                childImages.reserveCapacity(scale * scale)
+
+                for dy in 0..<scale {
+                    for dx in 0..<scale {
+                        let childPath = MKTileOverlayPath(
+                            x: requested.x * scale + dx,
+                            y: requested.y * scale + dy,
+                            z: childZ,
+                            contentScaleFactor: 1.0
+                        )
+                        let childStickyKey = Self.stickyTileKey(template: template, requested: childPath)
+                        guard let data = Self.freshStickyTile(key: childStickyKey) else {
+                            continue
+                        }
+                        guard let image = Self.decodeImage(data) else { continue }
+                        childImages.append((image: image, dx: dx, dy: dy))
+                    }
+                }
+
+                guard childImages.count >= requiredChildren else { continue }
+
+                let width = 256
+                let height = 256
+                let bitmapInfo =
+                    CGImageAlphaInfo.premultipliedLast.rawValue |
+                    CGBitmapInfo.byteOrder32Big.rawValue
+                guard let context = CGContext(
+                    data: nil,
+                    width: width,
+                    height: height,
+                    bitsPerComponent: 8,
+                    bytesPerRow: 0,
+                    space: CGColorSpaceCreateDeviceRGB(),
+                    bitmapInfo: bitmapInfo
+                ) else {
+                    return nil
+                }
+
+                context.interpolationQuality = .high
+                context.setShouldAntialias(false)
+                context.clear(CGRect(x: 0, y: 0, width: width, height: height))
+
+                for child in childImages {
+                    let rect = CGRect(
+                        x: child.dx * childTileSide,
+                        y: child.dy * childTileSide,
+                        width: childTileSide,
+                        height: childTileSide
+                    )
+                    context.draw(child.image, in: rect)
+                }
+
+                guard let bytes = context.data else { return nil }
+                let ptr = bytes.bindMemory(to: UInt8.self, capacity: width * height * 4)
+                let count = width * height
+                var visible = 0
+                for i in stride(from: 0, to: count, by: 29) {
+                    if ptr[i * 4 + 3] >= 3 {
+                        visible += 1
+                        if visible >= Self.minVisiblePixelsForGenericStore { break }
+                    }
+                }
+                guard visible >= Self.minVisiblePixelsForGenericFallback else { continue }
+                guard let outputImage = context.makeImage() else { return nil }
+
+                let output = NSMutableData()
+                guard let destination = CGImageDestinationCreateWithData(
+                    output,
+                    UTType.png.identifier as CFString,
+                    1,
+                    nil
+                ) else {
+                    return nil
+                }
+                CGImageDestinationAddImage(destination, outputImage, nil)
+                guard CGImageDestinationFinalize(destination) else { return nil }
+
+                return RenderedTile(
+                    data: output as Data,
+                    visiblePixelCount: max(visible, Self.minVisiblePixelsForGenericStore)
+                )
+            }
+
+            return nil
+        }
+
+        private static func fetchSourceTile(
+            url: URL,
+            timeout: TimeInterval,
+            z: Int,
+            x: Int,
+            y: Int,
+            completion: @escaping SourceTileCompletion
+        ) {
+            let isForecastBackendTile = url.absoluteString.contains("/v1/tiles/")
             let sourceCacheKey = url.absoluteString as NSString
-            if let cached = Self.sourceTileCache.object(forKey: sourceCacheKey) {
-                if ((x + y + z) & 31) == 0 {
+            if !isForecastBackendTile, let cached = sourceTileCache.object(forKey: sourceCacheKey) {
+                if debugLoggingEnabled && ((x + y + z) & 31) == 0 {
                     print("☁️DBG source cache-hit z=\(z) x=\(x) y=\(y)")
                 }
                 completion(cached as Data, 200, nil)
@@ -1826,47 +2569,64 @@ struct UIKitMap: UIViewRepresentable {
 
             let requestKey = url.absoluteString
             var shouldStartRequest = false
-            Self.sourceFetchStateQueue.sync {
-                if Self.inFlightSourceRequests[requestKey] != nil {
-                    Self.inFlightSourceRequests[requestKey]?.append(completion)
-                    if ((x + y + z) & 31) == 0 {
+            sourceFetchStateQueue.sync {
+                if inFlightSourceRequests[requestKey] != nil {
+                    inFlightSourceRequests[requestKey]?.append(completion)
+                    if debugLoggingEnabled && ((x + y + z) & 31) == 0 {
                         print("☁️DBG source join in-flight z=\(z) x=\(x) y=\(y)")
                     }
                 } else {
-                    Self.inFlightSourceRequests[requestKey] = [completion]
+                    inFlightSourceRequests[requestKey] = [completion]
                     shouldStartRequest = true
                 }
             }
             if !shouldStartRequest { return }
 
             var request = URLRequest(url: url)
-            request.timeoutInterval = 8
-            request.setValue(Self.userAgent, forHTTPHeaderField: "User-Agent")
+            request.timeoutInterval = timeout
+            request.setValue(userAgent, forHTTPHeaderField: "User-Agent")
             request.setValue("image/png,image/*;q=0.9,*/*;q=0.5", forHTTPHeaderField: "Accept")
+            if isForecastBackendTile {
+                request.cachePolicy = .reloadIgnoringLocalCacheData
+                request.setValue("no-cache, no-store, must-revalidate", forHTTPHeaderField: "Cache-Control")
+                request.setValue("no-cache", forHTTPHeaderField: "Pragma")
+                request.setValue("0", forHTTPHeaderField: "Expires")
+            }
 
-            Self.networkSession.dataTask(with: request) { data, response, error in
+            networkSession.dataTask(with: request) { data, response, error in
                 let statusCode = (response as? HTTPURLResponse)?.statusCode ?? -1
-                if statusCode != 200 {
-                    print("☁️ forecast tile z=\(z) x=\(x) y=\(y) status=\(statusCode) bytes=\(data?.count ?? 0)")
-                } else if ((x + y + z) & 31) == 0 {
-                    print("☁️ forecast tile 200 z=\(z) x=\(x) y=\(y) bytes=\(data?.count ?? 0)")
+                if debugLoggingEnabled {
+                    if statusCode != 200 {
+                        print("☁️ forecast tile z=\(z) x=\(x) y=\(y) status=\(statusCode) bytes=\(data?.count ?? 0)")
+                    } else if ((x + y + z) & 31) == 0 {
+                        print("☁️ forecast tile 200 z=\(z) x=\(x) y=\(y) bytes=\(data?.count ?? 0)")
+                    }
                 }
-                if statusCode == 200, let data, !data.isEmpty {
-                    Self.sourceTileCache.setObject(
+                if !isForecastBackendTile, statusCode == 200, let data, !data.isEmpty {
+                    sourceTileCache.setObject(
                         data as NSData,
                         forKey: sourceCacheKey,
                         cost: data.count
                     )
                 }
-                let callbacks: [SourceTileCompletion] = Self.sourceFetchStateQueue.sync {
-                    let pending = Self.inFlightSourceRequests[requestKey] ?? []
-                    Self.inFlightSourceRequests.removeValue(forKey: requestKey)
+                let callbacks: [SourceTileCompletion] = sourceFetchStateQueue.sync {
+                    let pending = inFlightSourceRequests[requestKey] ?? []
+                    inFlightSourceRequests.removeValue(forKey: requestKey)
                     return pending
                 }
                 for callback in callbacks {
                     callback(data, statusCode, error)
                 }
             }.resume()
+        }
+
+        static func flushSourceCaches() {
+            sourceTileCache.removeAllObjects()
+            decodedSourceImageCache.removeAllObjects()
+            sourceTileSignalCache.removeAllObjects()
+            sourceFetchStateQueue.sync {
+                inFlightSourceRequests.removeAll(keepingCapacity: false)
+            }
         }
 
         private func makeURL(
@@ -1884,7 +2644,12 @@ struct UIKitMap: UIViewRepresentable {
             x: Int,
             y: Int
         ) -> URL? {
-            let urlString = template
+            let normalizedTemplate = template
+                .replacingOccurrences(of: "%7Bz%7D", with: "{z}", options: .caseInsensitive)
+                .replacingOccurrences(of: "%7Bx%7D", with: "{x}", options: .caseInsensitive)
+                .replacingOccurrences(of: "%7By%7D", with: "{y}", options: .caseInsensitive)
+
+            let urlString = normalizedTemplate
                 .replacingOccurrences(of: "{z}", with: "\(z)")
                 .replacingOccurrences(of: "{x}", with: "\(x)")
                 .replacingOccurrences(of: "{y}", with: "\(y)")
@@ -1900,7 +2665,7 @@ struct UIKitMap: UIViewRepresentable {
             guard fromTemplate != toTemplate else { return .zero }
             guard zoom >= 0, !tiles.isEmpty else { return nil }
 
-            let sampledTiles = sampleTiles(tiles, limit: 52)
+            let sampledTiles = sampleTiles(tiles, limit: 28)
             var fromCentroid = WeightedCentroid()
             var toCentroid = WeightedCentroid()
 
@@ -2104,15 +2869,29 @@ struct UIKitMap: UIViewRepresentable {
         }
 
         private static func genericTileKey(
+            template: String,
             requested: MKTileOverlayPath
         ) -> String {
-            "\(cacheVersion)|generic|\(requested.z)|\(requested.x)|\(requested.y)"
+            "\(cacheVersion)|g\(currentFallbackGeneration())|\(template)|generic|\(requested.z)|\(requested.x)|\(requested.y)"
         }
 
         private static func stickyTileKey(
+            template: String,
             requested: MKTileOverlayPath
         ) -> String {
-            "\(cacheVersion)|sticky|\(requested.z)|\(requested.x)|\(requested.y)"
+            "\(cacheVersion)|g\(currentFallbackGeneration())|\(template)|sticky|\(requested.z)|\(requested.x)|\(requested.y)"
+        }
+
+        private static func currentFallbackGeneration() -> Int {
+            stickyStateQueue.sync { fallbackGeneration }
+        }
+
+        private static func bumpFallbackGeneration() {
+            stickyStateQueue.sync(flags: .barrier) {
+                fallbackGeneration &+= 1
+                stickyTileUpdatedAt.removeAll(keepingCapacity: true)
+            }
+            stickyTileCache.removeAllObjects()
         }
 
         private static func storeRenderedTile(
@@ -2184,7 +2963,7 @@ struct UIKitMap: UIViewRepresentable {
             }
             guard isFresh else {
                 stickyTileCache.removeObject(forKey: key as NSString)
-                stickyStateQueue.sync(flags: .barrier) {
+                _ = stickyStateQueue.sync(flags: .barrier) {
                     stickyTileUpdatedAt.removeValue(forKey: key)
                 }
                 return nil
@@ -2342,7 +3121,7 @@ struct UIKitMap: UIViewRepresentable {
             for y in stride(from: 0, to: height, by: step) {
                 for x in stride(from: 0, to: width, by: step) {
                     let idx = (y * width + x) * 4
-                    if ptr[idx + 3] >= 6 {
+                    if ptr[idx + 3] >= 3 {
                         visible += 1
                         if visible >= minVisiblePixelsForGenericFallback { return visible }
                     }
@@ -2356,6 +3135,158 @@ struct UIKitMap: UIViewRepresentable {
                 return nil
             }
             return CGImageSourceCreateImageAtIndex(source, 0, nil)
+        }
+
+        private static func logTileStats(
+            _ data: Data,
+            label: String,
+            path: MKTileOverlayPath
+        ) {
+            guard shouldSampleStats(path) else { return }
+            guard let image = decodeImage(data) else {
+                print("☁️DBG tile stats decode-failed", label, "z=\(path.z)", "x=\(path.x)", "y=\(path.y)")
+                return
+            }
+            guard
+                let context = CGContext(
+                    data: nil,
+                    width: image.width,
+                    height: image.height,
+                    bitsPerComponent: 8,
+                    bytesPerRow: 0,
+                    space: CGColorSpaceCreateDeviceRGB(),
+                    bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue |
+                        CGBitmapInfo.byteOrder32Big.rawValue
+                )
+            else {
+                return
+            }
+            context.draw(image, in: CGRect(x: 0, y: 0, width: image.width, height: image.height))
+            guard let bytes = context.data else { return }
+            let ptr = bytes.bindMemory(to: UInt8.self, capacity: image.width * image.height * 4)
+            let count = image.width * image.height
+            var minA: UInt8 = 255
+            var maxA: UInt8 = 0
+            var sumA: Double = 0
+            var minR: UInt8 = 255
+            var maxR: UInt8 = 0
+            var minG: UInt8 = 255
+            var maxG: UInt8 = 0
+            var minB: UInt8 = 255
+            var maxB: UInt8 = 0
+            var nonzero = 0
+            for i in 0..<count {
+                let idx = i * 4
+                let r = ptr[idx]
+                let g = ptr[idx + 1]
+                let b = ptr[idx + 2]
+                let a = ptr[idx + 3]
+                if a > 0 { nonzero += 1 }
+                minA = min(minA, a)
+                maxA = max(maxA, a)
+                sumA += Double(a)
+                minR = min(minR, r); maxR = max(maxR, r)
+                minG = min(minG, g); maxG = max(maxG, g)
+                minB = min(minB, b); maxB = max(maxB, b)
+            }
+            let meanA = sumA / Double(count)
+            print(
+                "☁️DBG tile stats",
+                label,
+                "z=\(path.z)",
+                "x=\(path.x)",
+                "y=\(path.y)",
+                "a[min,max,mean]=\(minA),\(maxA),\(String(format: "%.1f", meanA))",
+                "rgb[min]=\(minR),\(minG),\(minB)",
+                "rgb[max]=\(maxR),\(maxG),\(maxB)",
+                "nz=\(nonzero)"
+            )
+        }
+
+        private static func sourceImageCacheKey(
+            template: String,
+            z: Int,
+            x: Int,
+            y: Int
+        ) -> String {
+            if let url = makeURLStatic(template: template, z: z, x: x, y: y) {
+                return "\(cacheVersion)|source-image|\(url.absoluteString)"
+            }
+            return "\(cacheVersion)|source-image|\(template)|\(z)|\(x)|\(y)"
+        }
+
+        private static func isSuspiciousBypassSourceTile(_ data: Data) -> Bool {
+            // Disabled for now: aggressive filtering can hide real rain over London.
+            _ = data
+            return false
+        }
+
+        private static func shouldAvoidKnownStuckSourceTile(
+            template: String,
+            z: Int,
+            x: Int,
+            y: Int,
+            data: Data
+        ) -> Bool {
+            // Backend occasionally serves one stale static tile for this coordinate.
+            // Match by coordinate + payload fingerprint to avoid dropping valid rain.
+            if z == 7, x == 63, y == 42, data.count == 14_225 {
+                return fnv1a64(data) == 0x0498_0ffe_80fd_d5ff
+            }
+
+            // March 3rd 06:00 frame occasionally contains a stuck/blocked patch near Birmingham
+            // on source z=6 tiles. Keep this guard narrow by timestamp + tile neighborhood.
+            if template.contains("/202603030600/"),
+               z == 6,
+               (30...32).contains(x),
+               (20...22).contains(y)
+            {
+                return true
+            }
+
+            return false
+        }
+
+        private static func isBirminghamBBox(
+            sourceZ: Int,
+            sourceX: Int,
+            sourceY: Int
+        ) -> Bool {
+            switch sourceZ {
+            case 7:
+                return (60...64).contains(sourceX) && (40...44).contains(sourceY)
+            case 6:
+                return (30...32).contains(sourceX) && (20...22).contains(sourceY)
+            case 5:
+                return (15...16).contains(sourceX) && (10...11).contains(sourceY)
+            default:
+                return false
+            }
+        }
+
+        private static func fnv1a64(_ data: Data) -> UInt64 {
+            var hash: UInt64 = 1_469_598_103_934_665_603
+            for byte in data {
+                hash ^= UInt64(byte)
+                hash &*= 1_099_511_628_211
+            }
+            return hash
+        }
+
+        private static func decodeSourceImage(
+            _ data: Data,
+            cacheKey: String
+        ) -> CGImage? {
+            if let cached = decodedSourceImageCache.object(forKey: cacheKey as NSString) {
+                return cached.image
+            }
+            guard let decoded = decodeImage(data) else { return nil }
+            decodedSourceImageCache.setObject(
+                DecodedSourceImageBox(decoded),
+                forKey: cacheKey as NSString,
+                cost: data.count
+            )
+            return decoded
         }
 
         private static func cropAndScale(
@@ -2397,8 +3328,8 @@ struct UIKitMap: UIViewRepresentable {
                 image: cropped,
                 targetSize: targetSize,
                 interpolation: .high,
-                edgeSmoothingPasses: 5,
-                tileEdgeFeatherWidth: 2
+                edgeSmoothingPasses: 0,
+                tileEdgeFeatherWidth: 0
             )
         }
 
@@ -2429,23 +3360,135 @@ struct UIKitMap: UIViewRepresentable {
             let x1 = Int(floor(Double(xOffset + 1) * Double(srcW) / Double(scale)))
             let y1 = Int(floor(Double(yOffset + 1) * Double(srcH) / Double(scale)))
 
-            let cropX = max(0, min(srcW - 1, x0))
-            let cropY = max(0, min(srcH - 1, y0))
-            let cropW = max(1, min(srcW - cropX, x1 - x0))
-            let cropH = max(1, min(srcH - cropY, y1 - y0))
+            let baseCropX = max(0, min(srcW - 1, x0))
+            let baseCropY = max(0, min(srcH - 1, y0))
+            let baseCropW = max(1, min(srcW - baseCropX, x1 - x0))
+            let baseCropH = max(1, min(srcH - baseCropY, y1 - y0))
 
-            let cropRect = CGRect(
-                x: cropX,
-                y: cropY,
-                width: cropW,
-                height: cropH
+            let cropRect = stabilizedRawCropRect(
+                srcW: srcW,
+                srcH: srcH,
+                cropX: baseCropX,
+                cropY: baseCropY,
+                cropW: baseCropW,
+                cropH: baseCropH,
+                zoomDelta: zoomDelta
             )
 
-            guard let cropped = sourceImage.cropping(to: cropRect) else { return nil }
+            guard let cropped = sourceImage.cropping(to: cropRect) else {
+                return nil
+            }
+            let interpolation: CGInterpolationQuality = .high
             return renderRawTile(
                 image: cropped,
                 targetSize: targetSize,
-                interpolation: .none
+                interpolation: interpolation
+            )
+        }
+
+        private static func cropAndScalePassthrough(
+            sourceImage: CGImage,
+            requested: MKTileOverlayPath,
+            sourceZ: Int,
+            targetSize: CGSize
+        ) -> RenderedTile? {
+            let zoomDelta = requested.z - sourceZ
+            guard zoomDelta > 0 else {
+                return renderPassthroughTile(
+                    image: sourceImage,
+                    targetSize: targetSize,
+                    interpolation: .none
+                )
+            }
+
+            let scale = 1 << zoomDelta
+            let xOffset = requested.x % scale
+            let yOffset = requested.y % scale
+
+            let srcW = sourceImage.width
+            let srcH = sourceImage.height
+
+            let x0 = Int(floor(Double(xOffset) * Double(srcW) / Double(scale)))
+            let y0 = Int(floor(Double(yOffset) * Double(srcH) / Double(scale)))
+            let x1 = Int(floor(Double(xOffset + 1) * Double(srcW) / Double(scale)))
+            let y1 = Int(floor(Double(yOffset + 1) * Double(srcH) / Double(scale)))
+
+            let baseCropX = max(0, min(srcW - 1, x0))
+            let baseCropY = max(0, min(srcH - 1, y0))
+            let baseCropW = max(1, min(srcW - baseCropX, x1 - x0))
+            let baseCropH = max(1, min(srcH - baseCropY, y1 - y0))
+
+            // Use stabilized crop for deep overzoom to avoid 1px "on/off" flicker.
+            let cropRect = stabilizedRawCropRect(
+                srcW: srcW,
+                srcH: srcH,
+                cropX: baseCropX,
+                cropY: baseCropY,
+                cropW: baseCropW,
+                cropH: baseCropH,
+                zoomDelta: zoomDelta
+            )
+
+            guard let cropped = sourceImage.cropping(to: cropRect) else {
+                return nil
+            }
+            // Preserve weak/small precip fragments during overzoom.
+            // Smoothing can dilute alpha and make tiny clouds disappear.
+            let interpolation: CGInterpolationQuality = .none
+            return renderPassthroughTile(
+                image: cropped,
+                targetSize: targetSize,
+                interpolation: interpolation
+            )
+        }
+
+        private static func stabilizedRawCropRect(
+            srcW: Int,
+            srcH: Int,
+            cropX: Int,
+            cropY: Int,
+            cropW: Int,
+            cropH: Int,
+            zoomDelta: Int
+        ) -> CGRect {
+            // Deep overzoom (z12..z15 from z5 source) can map to 1-2 source pixels.
+            // Expand sampling window a bit to reduce "tile present/absent" flicker.
+            let minSample: Int
+            switch zoomDelta {
+            case ..<4:
+                minSample = 1
+            case 4:
+                minSample = 2
+            case 5:
+                minSample = 3
+            default:
+                minSample = 4
+            }
+
+            let sampleW = min(srcW, max(cropW, minSample))
+            let sampleH = min(srcH, max(cropH, minSample))
+
+            if sampleW == cropW && sampleH == cropH {
+                return CGRect(
+                    x: cropX,
+                    y: cropY,
+                    width: cropW,
+                    height: cropH
+                )
+            }
+
+            let centerX = cropX + cropW / 2
+            let centerY = cropY + cropH / 2
+            var sampleX = centerX - sampleW / 2
+            var sampleY = centerY - sampleH / 2
+            sampleX = max(0, min(srcW - sampleW, sampleX))
+            sampleY = max(0, min(srcH - sampleH, sampleY))
+
+            return CGRect(
+                x: sampleX,
+                y: sampleY,
+                width: sampleW,
+                height: sampleH
             )
         }
 
@@ -2501,8 +3544,8 @@ struct UIKitMap: UIViewRepresentable {
                 let ub = min(255.0, Double(ptr[idx + 2]) * unpremulScale)
 
                 // Remove opaque background and dark seam pixels from provider tiles.
-                let isNoRainBlack = ur <= 14.0 && ug <= 14.0 && ub <= 18.0
-                let isDarkSeam = ur < 70.0 && ug < 95.0 && ub < 140.0
+                let isNoRainBlack = ur <= 10.0 && ug <= 10.0 && ub <= 14.0
+                let isDarkSeam = ur < 32.0 && ug < 40.0 && ub < 60.0
                 if isNoRainBlack || isDarkSeam {
                     ptr[idx] = 0
                     ptr[idx + 1] = 0
@@ -2510,6 +3553,35 @@ struct UIKitMap: UIViewRepresentable {
                     ptr[idx + 3] = 0
                     continue
                 }
+
+                let sourceA = Double(alpha) / 255.0
+                let warmScore = Self.clamp01(((ur - ub) * 0.95 + (ug - ub) * 0.35) / 255.0)
+                let coldScore = Self.clamp01(((ub - ug) * 1.05 + (ub - ur) * 0.65) / 255.0)
+                let density = Self.clamp01((sourceA - 0.06) / 0.90)
+                let intensity = Self.clamp01(max(density * 0.86, density * 0.74 + warmScore * 0.26))
+                let stormScore = Self.clamp01(
+                    0.58 * Self.clamp01((sourceA - 0.83) / 0.17) +
+                    0.42 * warmScore
+                )
+
+                let color = Self.precipitationPalette(
+                    intensity: intensity,
+                    stormScore: stormScore,
+                    coldScore: coldScore,
+                    sourceAlpha: sourceA
+                )
+                if color.alpha < 0.03 {
+                    ptr[idx] = 0
+                    ptr[idx + 1] = 0
+                    ptr[idx + 2] = 0
+                    ptr[idx + 3] = 0
+                    continue
+                }
+
+                ptr[idx] = UInt8(max(0.0, min(255.0, color.red * color.alpha)).rounded())
+                ptr[idx + 1] = UInt8(max(0.0, min(255.0, color.green * color.alpha)).rounded())
+                ptr[idx + 2] = UInt8(max(0.0, min(255.0, color.blue * color.alpha)).rounded())
+                ptr[idx + 3] = UInt8(max(0.0, min(255.0, 255.0 * color.alpha)).rounded())
 
                 visiblePixelCount += 1
             }
@@ -2524,6 +3596,75 @@ struct UIKitMap: UIViewRepresentable {
                 if ptr[i * 4 + 3] >= 2 {
                     visiblePixelCount += 1
                 }
+            }
+
+            guard let outputImage = context.makeImage() else { return nil }
+
+            let output = NSMutableData()
+            guard let destination = CGImageDestinationCreateWithData(
+                output,
+                UTType.png.identifier as CFString,
+                1,
+                nil
+            ) else {
+                return nil
+            }
+            CGImageDestinationAddImage(destination, outputImage, nil)
+            guard CGImageDestinationFinalize(destination) else { return nil }
+
+            return RenderedTile(
+                data: output as Data,
+                visiblePixelCount: visiblePixelCount
+            )
+        }
+
+        private static func renderPassthroughTile(
+            image: CGImage,
+            targetSize: CGSize,
+            interpolation: CGInterpolationQuality
+        ) -> RenderedTile? {
+            let width = Int(targetSize.width)
+            let height = Int(targetSize.height)
+            guard width > 0, height > 0 else { return nil }
+
+            let bitmapInfo =
+                CGImageAlphaInfo.premultipliedLast.rawValue |
+                CGBitmapInfo.byteOrder32Big.rawValue
+
+            guard let context = CGContext(
+                data: nil,
+                width: width,
+                height: height,
+                bitsPerComponent: 8,
+                bytesPerRow: 0,
+                space: CGColorSpaceCreateDeviceRGB(),
+                bitmapInfo: bitmapInfo
+            ) else {
+                return nil
+            }
+
+            context.interpolationQuality = interpolation
+            context.setShouldAntialias(false)
+            context.clear(CGRect(origin: .zero, size: targetSize))
+            context.draw(image, in: CGRect(origin: .zero, size: targetSize))
+
+            guard let bytes = context.data else { return nil }
+            let ptr = bytes.bindMemory(to: UInt8.self, capacity: width * height * 4)
+            let count = width * height
+            var visiblePixelCount = 0
+
+            for i in 0..<count {
+                let idx = i * 4
+                let alpha = ptr[idx + 3]
+                if alpha == 0 {
+                    ptr[idx] = 0
+                    ptr[idx + 1] = 0
+                    ptr[idx + 2] = 0
+                    ptr[idx + 3] = 0
+                    continue
+                }
+                ptr[idx + 3] = alpha
+                visiblePixelCount += 1
             }
 
             guard let outputImage = context.makeImage() else { return nil }
@@ -2572,7 +3713,7 @@ struct UIKitMap: UIViewRepresentable {
                     let ur = min(255.0, Double(ptr[idx]) * unpremulScale)
                     let ug = min(255.0, Double(ptr[idx + 1]) * unpremulScale)
                     let ub = min(255.0, Double(ptr[idx + 2]) * unpremulScale)
-                    let looksLikeHalo = ur < 110.0 && ug < 145.0 && ub < 200.0
+                    let looksLikeHalo = ur < 126.0 && ug < 168.0 && ub < 230.0
                     if !looksLikeHalo { continue }
 
                     var touchesTransparent = false
@@ -2654,7 +3795,9 @@ struct UIKitMap: UIViewRepresentable {
                 let ub = min(255.0, sourceB * unpremulScale)
 
                 // Drop near-black/neutral backdrop fragments that create dark seams.
-                if ur <= 10.0 && ug <= 10.0 && ub <= 12.0 {
+                let isNoRainBlack = ur <= 10.0 && ug <= 10.0 && ub <= 12.0
+                let isDarkSeam = ur < 32.0 && ug < 40.0 && ub < 60.0
+                if isNoRainBlack || isDarkSeam {
                     ptr[idx] = 0
                     ptr[idx + 1] = 0
                     ptr[idx + 2] = 0
@@ -2664,31 +3807,39 @@ struct UIKitMap: UIViewRepresentable {
 
                 visiblePixelCount += 1
 
-                // Keep source shape and encode in readable rain palette.
-                let intensity = max(ur, max(ug, ub)) / 255.0
-                let warm = max(0.0, ur - ub) + max(0.0, ug - ub)
-                let stormScore = max(
-                    0.0,
-                    min(1.0, 0.58 * (warm / 255.0) + 0.42 * intensity)
-                )
-
-                var outUR = max(16.0, min(110.0, ur * 0.42 + 8.0))
-                var outUG = max(70.0, min(190.0, ug * 0.55 + 44.0))
-                var outUB = max(130.0, min(255.0, ub * 0.72 + 90.0))
-                if stormScore > 0.62 {
-                    let t = (stormScore - 0.62) / 0.38
-                    // Darker storm tint while preserving rain geometry.
-                    outUR = outUR * (1.0 - 0.88 * t)
-                    outUG = outUG * (1.0 - 0.84 * t)
-                    outUB = outUB * (1.0 - 0.78 * t)
-                }
                 let sourceA = Double(alpha) / 255.0
-                let outA = max(0.14, min(0.78, sourceA * (0.62 + 0.40 * intensity)))
+                let luminance = (0.299 * ur + 0.587 * ug + 0.114 * ub) / 255.0
+                let warmScore = Self.clamp01(((ur - ub) * 0.95 + (ug - ub) * 0.35) / 255.0)
+                let coldScore = Self.clamp01(((ub - ug) * 1.05 + (ub - ur) * 0.65) / 255.0)
+                let intensity = Self.clamp01(
+                    max(
+                        (1.0 - luminance - 0.18) / 0.62,
+                        (sourceA - 0.08) / 0.86
+                    )
+                )
+                let stormScore = Self.clamp01(
+                    0.56 * Self.clamp01((intensity - 0.72) / 0.28) +
+                    0.44 * warmScore
+                )
+                let color = Self.precipitationPalette(
+                    intensity: intensity,
+                    stormScore: stormScore,
+                    coldScore: coldScore,
+                    sourceAlpha: sourceA
+                )
+                if color.alpha < 0.03 {
+                    ptr[idx] = 0
+                    ptr[idx + 1] = 0
+                    ptr[idx + 2] = 0
+                    ptr[idx + 3] = 0
+                    visiblePixelCount -= 1
+                    continue
+                }
 
-                ptr[idx] = UInt8(max(0.0, min(255.0, outUR * outA)).rounded())
-                ptr[idx + 1] = UInt8(max(0.0, min(255.0, outUG * outA)).rounded())
-                ptr[idx + 2] = UInt8(max(0.0, min(255.0, outUB * outA)).rounded())
-                ptr[idx + 3] = UInt8(max(0.0, min(255.0, 255.0 * outA)).rounded())
+                ptr[idx] = UInt8(max(0.0, min(255.0, color.red * color.alpha)).rounded())
+                ptr[idx + 1] = UInt8(max(0.0, min(255.0, color.green * color.alpha)).rounded())
+                ptr[idx + 2] = UInt8(max(0.0, min(255.0, color.blue * color.alpha)).rounded())
+                ptr[idx + 3] = UInt8(max(0.0, min(255.0, 255.0 * color.alpha)).rounded())
             }
 
             // If processing removed all visible pixels while source had alpha,
@@ -2709,34 +3860,40 @@ struct UIKitMap: UIViewRepresentable {
                     let ur = min(255.0, r * unpremulScale)
                     let ug = min(255.0, g * unpremulScale)
                     let ub = min(255.0, b * unpremulScale)
-                    if ur <= 10.0 && ug <= 10.0 && ub <= 12.0 {
+                    let isNoRainBlack = ur <= 10.0 && ug <= 10.0 && ub <= 12.0
+                    let isDarkSeam = ur < 32.0 && ug < 40.0 && ub < 60.0
+                    if isNoRainBlack || isDarkSeam {
                         rawPtr[idx] = 0
                         rawPtr[idx + 1] = 0
                         rawPtr[idx + 2] = 0
                         rawPtr[idx + 3] = 0
                         continue
                     }
-                    let outA = max(0.10, min(0.42, Double(a) / 255.0 * 0.78))
-                    let intensity = max(ur, max(ug, ub)) / 255.0
-                    let warm = max(0.0, ur - ub) + max(0.0, ug - ub)
-                    let stormScore = max(
-                        0.0,
-                        min(1.0, 0.58 * (warm / 255.0) + 0.42 * intensity)
+                    let sourceA = Double(a) / 255.0
+                    let warmScore = Self.clamp01(((ur - ub) * 0.95 + (ug - ub) * 0.35) / 255.0)
+                    let coldScore = Self.clamp01(((ub - ug) * 1.05 + (ub - ur) * 0.65) / 255.0)
+                    let intensity = Self.clamp01((sourceA - 0.05) / 0.90)
+                    let stormScore = Self.clamp01(
+                        0.58 * Self.clamp01((sourceA - 0.83) / 0.17) +
+                        0.42 * warmScore
                     )
-
-                    var outUR = max(14.0, min(96.0, ur * 0.35 + 12.0))
-                    var outUG = max(62.0, min(172.0, ug * 0.46 + 40.0))
-                    var outUB = max(120.0, min(255.0, ub * 0.62 + 92.0))
-                    if stormScore > 0.62 {
-                        let t = (stormScore - 0.62) / 0.38
-                        outUR = outUR * (1.0 - 0.86 * t)
-                        outUG = outUG * (1.0 - 0.82 * t)
-                        outUB = outUB * (1.0 - 0.76 * t)
+                    let color = Self.precipitationPalette(
+                        intensity: intensity,
+                        stormScore: stormScore,
+                        coldScore: coldScore,
+                        sourceAlpha: min(sourceA, 0.42)
+                    )
+                    if color.alpha < 0.03 {
+                        rawPtr[idx] = 0
+                        rawPtr[idx + 1] = 0
+                        rawPtr[idx + 2] = 0
+                        rawPtr[idx + 3] = 0
+                        continue
                     }
-                    rawPtr[idx] = UInt8(max(0.0, min(255.0, outUR * outA)).rounded())
-                    rawPtr[idx + 1] = UInt8(max(0.0, min(255.0, outUG * outA)).rounded())
-                    rawPtr[idx + 2] = UInt8(max(0.0, min(255.0, outUB * outA)).rounded())
-                    rawPtr[idx + 3] = UInt8(max(0.0, min(255.0, 255.0 * outA)).rounded())
+                    rawPtr[idx] = UInt8(max(0.0, min(255.0, color.red * color.alpha)).rounded())
+                    rawPtr[idx + 1] = UInt8(max(0.0, min(255.0, color.green * color.alpha)).rounded())
+                    rawPtr[idx + 2] = UInt8(max(0.0, min(255.0, color.blue * color.alpha)).rounded())
+                    rawPtr[idx + 3] = UInt8(max(0.0, min(255.0, 255.0 * color.alpha)).rounded())
                     visiblePixelCount += 1
                 }
             }
@@ -2926,6 +4083,44 @@ struct UIKitMap: UIViewRepresentable {
 
         private static func clamp01(_ value: Double) -> Double {
             max(0.0, min(1.0, value))
+        }
+
+        private static func precipitationPalette(
+            intensity: Double,
+            stormScore: Double,
+            coldScore: Double,
+            sourceAlpha: Double
+        ) -> (red: Double, green: Double, blue: Double, alpha: Double) {
+            let rain = clamp01(intensity)
+            let storm = clamp01(stormScore)
+            let cold = clamp01(coldScore)
+            let snow = clamp01(cold * (1.0 - storm * 0.90))
+
+            var red = lerp(170.0, 24.0, rain)
+            var green = lerp(222.0, 56.0, rain)
+            var blue = lerp(255.0, 138.0, rain)
+            var alpha = 0.18 + 0.66 * rain
+
+            if snow > 0.08 {
+                let snowMix = 0.42 + 0.42 * snow
+                let snowRed = lerp(255.0, 232.0, rain)
+                let snowGreen = lerp(255.0, 238.0, rain)
+                let snowBlue = lerp(255.0, 246.0, rain)
+                red = mix(red, snowRed, snowMix)
+                green = mix(green, snowGreen, snowMix)
+                blue = mix(blue, snowBlue, snowMix)
+                alpha = max(alpha * 0.84, 0.20 + rain * 0.48)
+            }
+
+            if storm > 0.04 {
+                let s = clamp01(storm * 1.20)
+                red = mix(red, 4.0, s)
+                green = mix(green, 4.0, s)
+                blue = mix(blue, 8.0, s)
+                alpha = max(alpha, 0.44 + 0.48 * s)
+            }
+
+            return (red, green, blue, clamp01(alpha * sourceAlpha))
         }
 
         private static func lerp(_ a: Double, _ b: Double, _ t: Double) -> Double {
@@ -3217,21 +4412,22 @@ struct UIKitMap: UIViewRepresentable {
 
     class Coordinator: NSObject, MKMapViewDelegate {
 
-        static let forecastTargetAlphaDark: CGFloat = 0.92
-        static let forecastTargetAlphaLight: CGFloat = 0.90
+        static let forecastTargetAlphaDark: CGFloat = 0.66
+        static let forecastTargetAlphaLight: CGFloat = 0.62
 
         var currentForecastTargetAlpha: CGFloat {
             parent.isDarkTheme ? Self.forecastTargetAlphaDark : Self.forecastTargetAlphaLight
         }
 
         var currentForecastToneDarkening: CGFloat {
-            parent.isDarkTheme ? 0.46 : 0.0
+            0.0
         }
 
         var parent: UIKitMap
         var firstLocationFix = true
         var lastRadarPath: String?
         var overlay: MKTileOverlay?
+        var baseMapOverlay: MKTileOverlay?
         var forecastOverlay: MKTileOverlay?
         var forecastRenderer: ForecastTileRenderer?
         var lastForecastOverlayKey: String?
@@ -3241,28 +4437,33 @@ struct UIKitMap: UIViewRepresentable {
         var forecastTransitionToken: Int = 0
         var pendingForecastTransitionRetry: DispatchWorkItem?
         var pendingForecastRetryAttempts: Int = 0
+        let maxPendingForecastRetryAttempts: Int = 10
+        var forecastTransitionArmed: Bool = false
         var pendingForecastMotion: CGPoint = .zero
         var isViewportChanging = false
         var viewportSettledWorkItem: DispatchWorkItem?
+        var lastForecastZoomLevel: Int?
+        var lastZoomFadeAt: Date = .distantPast
         var staticOverlay: RadarImageOverlay?
-        var weatherOverlay: WeatherFieldOverlay?
+        var weatherOverlays: [WeatherBlobOverlay] = []
+        var pendingWeatherPreviousOverlays: [WeatherBlobOverlay] = []
+        var weatherOverlayAlpha: [ObjectIdentifier: CGFloat] = [:]
+        var weatherFadeTimer: Timer?
+        var weatherTransitionToken: Int = 0
         var lastWeatherSignature: Int?
         var lastUserVisible: Bool = true
         var lastLocatorVisible: Bool = false
         weak var mapView: MKMapView?
-        var locatorButton: UIButton?
+        var locatorButton: MKUserTrackingButton?
         var compassButton: MKCompassButton?
         var locatorBottomConstraint: NSLayoutConstraint?
         var locatorTrailingConstraint: NSLayoutConstraint?
         var locatorWidthConstraint: NSLayoutConstraint?
         var locatorHeightConstraint: NSLayoutConstraint?
-        var locatorGlyphWidthConstraint: NSLayoutConstraint?
-        var locatorGlyphHeightConstraint: NSLayoutConstraint?
         var compassBottomConstraint: NSLayoutConstraint?
         var compassTrailingConstraint: NSLayoutConstraint?
         var compassWidthConstraint: NSLayoutConstraint?
         var compassHeightConstraint: NSLayoutConstraint?
-        var locatorGlyphView: UIImageView?
         var lastControlThemeIsDark: Bool?
         var lastVisibleTileSignature: Int?
         var visibleTileWorkItem: DispatchWorkItem?
@@ -3282,6 +4483,108 @@ struct UIKitMap: UIViewRepresentable {
             forecastTransitionToken += 1
         }
 
+        func stopWeatherFade(on mapView: MKMapView?) {
+            weatherFadeTimer?.invalidate()
+            weatherFadeTimer = nil
+            weatherTransitionToken += 1
+
+            if let mapView {
+                for overlay in weatherOverlays {
+                    if let renderer = mapView.renderer(for: overlay) {
+                        renderer.alpha = 1.0
+                        renderer.setNeedsDisplay()
+                    }
+                }
+            }
+        }
+
+        func startWeatherFade(
+            on mapView: MKMapView,
+            outgoing: [WeatherBlobOverlay],
+            incoming: [WeatherBlobOverlay]
+        ) {
+            stopWeatherFade(on: mapView)
+
+            let token = weatherTransitionToken
+            let duration: TimeInterval = 0.42
+            let steps = max(1, Int(duration / (1.0 / 30.0)))
+            var step = 0
+
+            for overlay in outgoing {
+                weatherOverlayAlpha[ObjectIdentifier(overlay)] = 1.0
+                if let renderer = mapView.renderer(for: overlay) {
+                    renderer.alpha = 1.0
+                    renderer.setNeedsDisplay()
+                }
+            }
+
+            for overlay in incoming {
+                weatherOverlayAlpha[ObjectIdentifier(overlay)] = 0.0
+                if let renderer = mapView.renderer(for: overlay) {
+                    renderer.alpha = 0.0
+                    renderer.setNeedsDisplay()
+                }
+            }
+
+            weatherFadeTimer = Timer.scheduledTimer(
+                withTimeInterval: duration / Double(steps),
+                repeats: true
+            ) { [weak self, weak mapView] timer in
+                guard let self, let mapView else {
+                    timer.invalidate()
+                    return
+                }
+                guard self.weatherTransitionToken == token else {
+                    timer.invalidate()
+                    return
+                }
+
+                step += 1
+                let t = min(1.0, Double(step) / Double(steps))
+                let eased = CGFloat(t * t * (3.0 - 2.0 * t))
+                let incomingAlpha = eased
+                let outgoingAlpha = 1.0 - eased
+
+                for overlay in incoming {
+                    self.weatherOverlayAlpha[ObjectIdentifier(overlay)] = incomingAlpha
+                    if let renderer = mapView.renderer(for: overlay) {
+                        renderer.alpha = incomingAlpha
+                        renderer.setNeedsDisplay()
+                    }
+                }
+
+                for overlay in outgoing {
+                    self.weatherOverlayAlpha[ObjectIdentifier(overlay)] = outgoingAlpha
+                    if let renderer = mapView.renderer(for: overlay) {
+                        renderer.alpha = outgoingAlpha
+                        renderer.setNeedsDisplay()
+                    }
+                }
+
+                if step >= steps {
+                    timer.invalidate()
+                    self.weatherFadeTimer = nil
+
+                    mapView.removeOverlays(outgoing)
+                    self.pendingWeatherPreviousOverlays.removeAll()
+                    for overlay in outgoing {
+                        self.weatherOverlayAlpha.removeValue(forKey: ObjectIdentifier(overlay))
+                    }
+                    for overlay in incoming {
+                        self.weatherOverlayAlpha[ObjectIdentifier(overlay)] = 1.0
+                        if let renderer = mapView.renderer(for: overlay) {
+                            renderer.alpha = 1.0
+                            renderer.setNeedsDisplay()
+                        }
+                    }
+                }
+            }
+
+            if let timer = weatherFadeTimer {
+                RunLoop.main.add(timer, forMode: .common)
+            }
+        }
+
         private func normalizeForecastRenderers() {
             let targetAlpha = currentForecastTargetAlpha
             let toneDarkening = currentForecastToneDarkening
@@ -3299,15 +4602,21 @@ struct UIKitMap: UIViewRepresentable {
             }
         }
 
-        func clearPendingForecastOverlay(on mapView: MKMapView) {
+        func clearPendingForecastOverlay(
+            on mapView: MKMapView,
+            keeping keepOverlay: MKTileOverlay? = nil
+        ) {
             pendingForecastTransitionRetry?.cancel()
             pendingForecastTransitionRetry = nil
             pendingForecastRetryAttempts = 0
-            if let overlay = pendingForecastPreviousOverlay {
+            if let overlay = pendingForecastPreviousOverlay,
+               !(keepOverlay.map { $0 === overlay } ?? false)
+            {
                 mapView.removeOverlay(overlay)
             }
             pendingForecastPreviousOverlay = nil
             pendingForecastPreviousRenderer = nil
+            forecastTransitionArmed = false
         }
 
         func setPendingForecastTransition(
@@ -3317,6 +4626,7 @@ struct UIKitMap: UIViewRepresentable {
             pendingForecastPreviousOverlay = fromOverlay
             pendingForecastPreviousRenderer = fromRenderer
             pendingForecastRetryAttempts = 0
+            forecastTransitionArmed = (fromOverlay != nil)
         }
 
         func isIncomingForecastReady(on mapView: MKMapView) -> Bool {
@@ -3326,10 +4636,23 @@ struct UIKitMap: UIViewRepresentable {
             guard let snapshot = Self.makeVisibleTileSnapshot(for: mapView) else {
                 return true
             }
-            return incomingOverlay.hasCachedCoverage(
+            let minTiles = max(2, min(8, snapshot.tiles.count))
+            if incomingOverlay.hasCachedCoverage(
                 zoom: snapshot.zoom,
                 tiles: snapshot.tiles,
-                minimumTiles: 2
+                minimumTiles: minTiles
+            ) {
+                return true
+            }
+            let descriptor = incomingOverlay.sourceCoverageDescriptor()
+            let minSourceTiles = max(2, min(6, snapshot.tiles.count))
+            return ForecastTileOverlay.hasSourceCacheCoverage(
+                template: descriptor.template,
+                minSourceZ: descriptor.minSourceZ,
+                maxSourceZ: descriptor.maxSourceZ,
+                requestedZoom: snapshot.zoom,
+                visibleTiles: snapshot.tiles,
+                minimumTiles: minSourceTiles
             )
         }
 
@@ -3364,10 +4687,21 @@ struct UIKitMap: UIViewRepresentable {
 
             guard let outgoingOverlay = pendingForecastPreviousOverlay else {
                 pendingForecastRetryAttempts = 0
-                incomingRenderer.alpha = targetAlpha
+                guard forecastTransitionArmed else {
+                    incomingRenderer.alpha = targetAlpha
+                    incomingRenderer.toneDarkening = toneDarkening
+                    incomingRenderer.transitionOffset = .zero
+                    incomingRenderer.setNeedsDisplay()
+                    return
+                }
+                forecastTransitionArmed = false
+                let startAlpha = min(targetAlpha, max(0.20, targetAlpha * 0.26))
+                incomingRenderer.alpha = startAlpha
                 incomingRenderer.toneDarkening = toneDarkening
                 incomingRenderer.transitionOffset = .zero
                 incomingRenderer.setNeedsDisplay()
+                let simpleFadeDuration: TimeInterval = isViewportChanging ? 0.20 : 0.28
+                startForecastFade(from: startAlpha, to: targetAlpha, duration: simpleFadeDuration)
                 return
             }
 
@@ -3379,6 +4713,44 @@ struct UIKitMap: UIViewRepresentable {
             }()
 
             let token = forecastTransitionToken
+            if isViewportChanging {
+                pendingForecastRetryAttempts += 1
+                incomingRenderer.alpha = 0
+                incomingRenderer.toneDarkening = toneDarkening
+                incomingRenderer.transitionOffset = .zero
+                incomingRenderer.setNeedsDisplay()
+
+                if let outgoingRenderer {
+                    outgoingRenderer.alpha = targetAlpha
+                    outgoingRenderer.toneDarkening = toneDarkening
+                    outgoingRenderer.transitionOffset = .zero
+                    outgoingRenderer.setNeedsDisplay()
+                    pendingForecastPreviousRenderer = outgoingRenderer
+                }
+
+                schedulePendingTransitionRetry(on: mapView, token: token)
+                return
+            }
+            if !isIncomingForecastReady(on: mapView) {
+                pendingForecastRetryAttempts += 1
+                incomingRenderer.alpha = 0
+                incomingRenderer.toneDarkening = toneDarkening
+                incomingRenderer.transitionOffset = .zero
+                incomingRenderer.setNeedsDisplay()
+
+                if let outgoingRenderer {
+                    outgoingRenderer.alpha = targetAlpha
+                    outgoingRenderer.toneDarkening = toneDarkening
+                    outgoingRenderer.transitionOffset = .zero
+                    outgoingRenderer.setNeedsDisplay()
+                    pendingForecastPreviousRenderer = outgoingRenderer
+                }
+                if pendingForecastRetryAttempts >= maxPendingForecastRetryAttempts {
+                    pendingForecastRetryAttempts = maxPendingForecastRetryAttempts
+                }
+                schedulePendingTransitionRetry(on: mapView, token: token)
+                return
+            }
             pendingForecastRetryAttempts = 0
             // Old renderer can be temporarily unavailable during rapid overlay churn.
             // In that case keep old layer until new one is ready, then swap without fade.
@@ -3386,16 +4758,20 @@ struct UIKitMap: UIViewRepresentable {
                 mapView.removeOverlay(outgoingOverlay)
                 pendingForecastPreviousOverlay = nil
                 pendingForecastPreviousRenderer = nil
+                forecastTransitionArmed = false
                 pendingForecastMotion = .zero
-                incomingRenderer.alpha = targetAlpha
+                let startAlpha = min(targetAlpha, max(0.20, targetAlpha * 0.26))
+                incomingRenderer.alpha = startAlpha
                 incomingRenderer.toneDarkening = toneDarkening
                 incomingRenderer.transitionOffset = .zero
                 incomingRenderer.setNeedsDisplay()
+                let simpleFadeDuration: TimeInterval = isViewportChanging ? 0.20 : 0.28
+                startForecastFade(from: startAlpha, to: targetAlpha, duration: simpleFadeDuration)
                 return
             }
 
             pendingForecastPreviousRenderer = outgoingRenderer
-            let duration: TimeInterval = 0.55
+            let duration: TimeInterval = isViewportChanging ? 0.34 : 0.66
             let steps = max(1, Int(duration / (1.0 / 60.0)))
             var step = 0
             let motion = isViewportChanging ? .zero : pendingForecastMotion
@@ -3434,19 +4810,29 @@ struct UIKitMap: UIViewRepresentable {
 
                 step += 1
                 let t = min(1.0, Double(step) / Double(steps))
-                let eased = t * t * (3.0 - 2.0 * t)
-                incomingRenderer.alpha = targetAlpha * CGFloat(eased)
-                outgoingRenderer.alpha = targetAlpha * CGFloat(1.0 - eased)
+
+                // "Slider-like" blending:
+                // incoming rises faster, outgoing holds longer then fades slowly.
+                let inPhase = min(1.0, t / 0.58)
+                let incomingEased = inPhase * inPhase * (3.0 - 2.0 * inPhase)
+
+                let outDelay = 0.20
+                let outProgressRaw = max(0.0, (t - outDelay) / (1.0 - outDelay))
+                let outProgress = outProgressRaw * outProgressRaw * (3.0 - 2.0 * outProgressRaw)
+                let outgoingEased = 1.0 - outProgress
+
+                incomingRenderer.alpha = targetAlpha * CGFloat(incomingEased)
+                outgoingRenderer.alpha = targetAlpha * CGFloat(outgoingEased)
                 incomingRenderer.toneDarkening = toneDarkening
                 outgoingRenderer.toneDarkening = toneDarkening
                 let effectiveMotion = self.isViewportChanging ? .zero : motion
                 incomingRenderer.transitionOffset = CGPoint(
-                    x: -effectiveMotion.x * CGFloat(0.35 * (1.0 - eased)),
-                    y: -effectiveMotion.y * CGFloat(0.35 * (1.0 - eased))
+                    x: -effectiveMotion.x * CGFloat(0.28 * (1.0 - incomingEased)),
+                    y: -effectiveMotion.y * CGFloat(0.28 * (1.0 - incomingEased))
                 )
                 outgoingRenderer.transitionOffset = CGPoint(
-                    x: effectiveMotion.x * CGFloat(0.35 * eased),
-                    y: effectiveMotion.y * CGFloat(0.35 * eased)
+                    x: effectiveMotion.x * CGFloat(0.20 * (1.0 - outgoingEased)),
+                    y: effectiveMotion.y * CGFloat(0.20 * (1.0 - outgoingEased))
                 )
                 incomingRenderer.setNeedsDisplay()
                 outgoingRenderer.setNeedsDisplay()
@@ -3465,6 +4851,7 @@ struct UIKitMap: UIViewRepresentable {
                     mapView.removeOverlay(outgoingOverlay)
                     self.pendingForecastPreviousOverlay = nil
                     self.pendingForecastPreviousRenderer = nil
+                    self.forecastTransitionArmed = false
                     self.pendingForecastMotion = .zero
                 }
             }
@@ -3479,22 +4866,18 @@ struct UIKitMap: UIViewRepresentable {
             let controlSide = controlButtonSide(for: mapView)
 
             if locatorButton == nil {
-                let locator = UIButton(type: .system)
-                if #available(iOS 15.0, *) {
-                    locator.configuration = .plain()
-                }
+                let locator = MKUserTrackingButton(mapView: mapView)
                 locator.translatesAutoresizingMaskIntoConstraints = false
                 locator.layer.cornerRadius = 11
                 locator.clipsToBounds = true
                 locator.alpha = 0
                 locator.isHidden = true
-                locator.addTarget(self, action: #selector(locatorTapped), for: .touchUpInside)
                 mapView.addSubview(locator)
                 locatorButton = locator
 
                 locatorTrailingConstraint = locator.trailingAnchor.constraint(
-                    equalTo: mapView.trailingAnchor,
-                    constant: -16
+                    equalTo: mapView.safeAreaLayoutGuide.trailingAnchor,
+                    constant: -20
                 )
                 locatorBottomConstraint = locator.bottomAnchor.constraint(
                     equalTo: mapView.bottomAnchor,
@@ -3508,23 +4891,6 @@ struct UIKitMap: UIViewRepresentable {
                     locatorWidthConstraint,
                     locatorHeightConstraint
                 ].compactMap { $0 })
-
-                let glyph = UIImageView(
-                    image: UIImage(systemName: "location.fill")
-                )
-                glyph.translatesAutoresizingMaskIntoConstraints = false
-                glyph.contentMode = .scaleAspectFit
-                glyph.isUserInteractionEnabled = false
-                locator.addSubview(glyph)
-                locatorGlyphWidthConstraint = glyph.widthAnchor.constraint(equalToConstant: max(20, controlSide * 0.38))
-                locatorGlyphHeightConstraint = glyph.heightAnchor.constraint(equalToConstant: max(20, controlSide * 0.38))
-                NSLayoutConstraint.activate([
-                    glyph.centerXAnchor.constraint(equalTo: locator.centerXAnchor),
-                    glyph.centerYAnchor.constraint(equalTo: locator.centerYAnchor),
-                    locatorGlyphWidthConstraint,
-                    locatorGlyphHeightConstraint
-                ].compactMap { $0 })
-                locatorGlyphView = glyph
             }
 
             if compassButton == nil {
@@ -3538,8 +4904,8 @@ struct UIKitMap: UIViewRepresentable {
                 compassButton = compass
 
                 compassTrailingConstraint = compass.trailingAnchor.constraint(
-                    equalTo: mapView.trailingAnchor,
-                    constant: -16
+                    equalTo: mapView.safeAreaLayoutGuide.trailingAnchor,
+                    constant: -20
                 )
                 compassBottomConstraint = compass.bottomAnchor.constraint(
                     equalTo: locatorButton.topAnchor,
@@ -3566,25 +4932,24 @@ struct UIKitMap: UIViewRepresentable {
             lastControlThemeIsDark = isDarkTheme
 
             let tintColor = isDarkTheme ? UIColor.white : UIColor.black
-            let plateColor = isDarkTheme
-                ? UIColor.black.withAlphaComponent(0.28)
-                : UIColor.white.withAlphaComponent(0.60)
+            let compassPlateColor = isDarkTheme
+                ? UIColor.black.withAlphaComponent(0.16)
+                : UIColor.white.withAlphaComponent(0.18)
+            let locatorPlateColor = compassPlateColor
 
             if let locatorButton {
-                // Hide default glyph and draw a filled locator icon on top.
-                locatorButton.tintColor = .clear
+                locatorButton.tintColor = tintColor
                 styleCircularLocator(
                     locatorButton,
-                    plateColor: plateColor
+                    plateColor: locatorPlateColor
                 )
-                locatorGlyphView?.tintColor = tintColor
             }
 
             if let compassButton {
                 compassButton.tintColor = tintColor
                 styleCircularCompass(
                     compassButton,
-                    plateColor: plateColor
+                    plateColor: compassPlateColor
                 )
             }
         }
@@ -3598,9 +4963,13 @@ struct UIKitMap: UIViewRepresentable {
             control.layer.cornerRadius = side > 0 ? side / 2 : 999
             control.layer.cornerCurve = .continuous
             control.clipsToBounds = true
-            control.layer.borderWidth = 0
-            control.layer.borderColor = UIColor.clear.cgColor
+            control.layer.borderWidth = 1
+            control.layer.borderColor = UIColor.white.withAlphaComponent(0.18).cgColor
             control.backgroundColor = plateColor
+            control.layer.shadowColor = UIColor.black.withAlphaComponent(0.10).cgColor
+            control.layer.shadowOpacity = 1
+            control.layer.shadowOffset = CGSize(width: 0, height: 6)
+            control.layer.shadowRadius = 12
         }
 
         private func styleCircularCompass(
@@ -3612,15 +4981,13 @@ struct UIKitMap: UIViewRepresentable {
             control.layer.cornerRadius = side > 0 ? side / 2 : 999
             control.layer.cornerCurve = .continuous
             control.clipsToBounds = true
-            control.layer.borderWidth = 0
-            control.layer.borderColor = UIColor.clear.cgColor
+            control.layer.borderWidth = 1
+            control.layer.borderColor = UIColor.white.withAlphaComponent(0.18).cgColor
             control.backgroundColor = plateColor
-        }
-
-        @objc
-        private func locatorTapped() {
-            guard let mapView else { return }
-            recenterToUser(on: mapView, resetZoom: false)
+            control.layer.shadowColor = UIColor.black.withAlphaComponent(0.10).cgColor
+            control.layer.shadowOpacity = 1
+            control.layer.shadowOffset = CGSize(width: 0, height: 6)
+            control.layer.shadowRadius = 12
         }
 
         func logOverlayModeIfChanged(
@@ -3649,16 +5016,13 @@ struct UIKitMap: UIViewRepresentable {
         }
 
         func updateControlsLayout(for mapView: MKMapView) {
-            let controlBottomInset = mapView.safeAreaInsets.bottom + max(16, parent.bottomReservedSpace - 10)
+            let controlBottomInset = mapView.safeAreaInsets.bottom + max(36, parent.bottomReservedSpace + 44)
             locatorBottomConstraint?.constant = -controlBottomInset
             let controlSide = controlButtonSide(for: mapView)
             locatorWidthConstraint?.constant = controlSide
             locatorHeightConstraint?.constant = controlSide
             compassWidthConstraint?.constant = controlSide
             compassHeightConstraint?.constant = controlSide
-            let glyphSide = max(20, controlSide * 0.38)
-            locatorGlyphWidthConstraint?.constant = glyphSide
-            locatorGlyphHeightConstraint?.constant = glyphSide
             if let locatorButton {
                 styleCircularLocator(locatorButton, plateColor: locatorButton.backgroundColor ?? .clear)
             }
@@ -3669,9 +5033,9 @@ struct UIKitMap: UIViewRepresentable {
 
         private func controlButtonSide(for mapView: MKMapView) -> CGFloat {
             let minSide = min(mapView.bounds.width, mapView.bounds.height)
-            if minSide >= 820 { return 82 }
-            if minSide >= 620 { return 76 }
-            return 68
+            if minSide >= 820 { return 60 }
+            if minSide >= 620 { return 54 }
+            return 48
         }
 
         func syncControlsState(for mapView: MKMapView) {
@@ -3719,12 +5083,60 @@ struct UIKitMap: UIViewRepresentable {
         }
 
         func publishVisibleTileSnapshot(for mapView: MKMapView) {
+            if isViewportChanging {
+                scheduleVisibleTileSnapshot(for: mapView)
+                return
+            }
             guard let snapshot = Self.makeVisibleTileSnapshot(for: mapView) else { return }
+            maybeStartZoomForecastFadeIfNeeded(snapshot: snapshot)
             guard snapshot.signature != lastVisibleTileSignature else { return }
             lastVisibleTileSignature = snapshot.signature
             DispatchQueue.main.async { [weak self] in
                 self?.parent.onVisibleTilesChanged?(snapshot)
             }
+        }
+
+        private func maybeStartZoomForecastFadeIfNeeded(snapshot: VisibleTileSnapshot) {
+            defer { lastForecastZoomLevel = snapshot.zoom }
+            // Dedicated zoom fade is disabled: it adds extra churn and can stutter on device.
+            return
+
+            guard let previousZoom = lastForecastZoomLevel else { return }
+            guard previousZoom != snapshot.zoom else { return }
+            guard pendingForecastPreviousOverlay == nil else { return }
+            guard let renderer = forecastRenderer else { return }
+            guard let overlay = forecastOverlay as? ForecastTileOverlay else { return }
+            guard Date().timeIntervalSince(lastZoomFadeAt) >= 0.24 else { return }
+
+            // Avoid blink: run zoom fade only when current zoom tiles are already cached.
+            let minimumCoverage = max(2, min(8, snapshot.tiles.count / 2))
+            guard overlay.hasCachedCoverage(
+                zoom: snapshot.zoom,
+                tiles: snapshot.tiles,
+                minimumTiles: minimumCoverage
+            ) else {
+                return
+            }
+
+            let targetAlpha = currentForecastTargetAlpha
+            let isZoomIn = snapshot.zoom > previousZoom
+            guard isZoomIn else {
+                renderer.transitionOffset = .zero
+                renderer.toneDarkening = currentForecastToneDarkening
+                renderer.alpha = targetAlpha
+                renderer.setNeedsDisplay()
+                print("☁️DBG zoom fade disabled dir=out")
+                return
+            }
+            let startAlpha = min(targetAlpha, max(0.52, targetAlpha * 0.90))
+            let duration: TimeInterval = 0.16
+            renderer.transitionOffset = .zero
+            renderer.toneDarkening = currentForecastToneDarkening
+            renderer.alpha = startAlpha
+            renderer.setNeedsDisplay()
+            print("☁️DBG zoom fade from=\(previousZoom) to=\(snapshot.zoom) dir=in")
+            startForecastFade(from: startAlpha, to: targetAlpha, duration: duration)
+            lastZoomFadeAt = Date()
         }
 
         func scheduleVisibleTileSnapshot(for mapView: MKMapView) {
@@ -3734,7 +5146,7 @@ struct UIKitMap: UIViewRepresentable {
                 self.publishVisibleTileSnapshot(for: mapView)
             }
             visibleTileWorkItem = work
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.18, execute: work)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.24, execute: work)
         }
 
         private static func makeVisibleTileSnapshot(
@@ -3892,7 +5304,20 @@ struct UIKitMap: UIViewRepresentable {
                 self?.isViewportChanging = false
             }
             viewportSettledWorkItem = work
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.26, execute: work)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.55, execute: work)
+        }
+
+        private func suspendForecastCrossfade(on mapView: MKMapView) {
+            guard pendingForecastPreviousOverlay != nil || forecastFadeTimer != nil else { return }
+            stopForecastFade()
+            clearPendingForecastOverlay(on: mapView, keeping: forecastOverlay)
+            let targetAlpha = currentForecastTargetAlpha
+            let toneDarkening = currentForecastToneDarkening
+            forecastRenderer?.alpha = targetAlpha
+            forecastRenderer?.toneDarkening = toneDarkening
+            forecastRenderer?.transitionOffset = .zero
+            forecastRenderer?.setNeedsDisplay()
+            print("☁️DBG crossfade suspended (zoom)")
         }
 
         func startForecastFade(
@@ -3941,8 +5366,11 @@ struct UIKitMap: UIViewRepresentable {
             rendererFor overlay: MKOverlay
         ) -> MKOverlayRenderer {
 
-            if let weatherOverlay = overlay as? WeatherFieldOverlay {
-                return WeatherFieldRenderer(overlay: weatherOverlay)
+            if let weatherOverlay = overlay as? WeatherBlobOverlay {
+                let renderer = WeatherBlobRenderer(overlay: weatherOverlay)
+                let alpha = weatherOverlayAlpha[ObjectIdentifier(weatherOverlay)] ?? 1.0
+                renderer.alpha = alpha
+                return renderer
             }
 
             if let tile = overlay as? ForecastTileOverlay {
@@ -3955,7 +5383,9 @@ struct UIKitMap: UIViewRepresentable {
                     renderer.toneDarkening = toneDarkening
                     renderer.transitionOffset = .zero
                     print("☁️ renderer attach active")
-                    startPendingForecastTransitionIfPossible(on: mapView)
+                    if pendingForecastPreviousOverlay != nil || forecastTransitionArmed {
+                        startPendingForecastTransitionIfPossible(on: mapView)
+                    }
                     return renderer
                 }
 
@@ -3967,7 +5397,11 @@ struct UIKitMap: UIViewRepresentable {
 
             if let tile = overlay as? MKTileOverlay {
                 let renderer = MKTileOverlayRenderer(tileOverlay: tile)
-                renderer.alpha = 0.65
+                if let base = baseMapOverlay, base === tile {
+                    renderer.alpha = 1.0
+                } else {
+                    renderer.alpha = 0.65
+                }
                 return renderer
             }
 
@@ -3981,8 +5415,8 @@ struct UIKitMap: UIViewRepresentable {
 
         func mapViewDidChangeVisibleRegion(_ mapView: MKMapView) {
             markViewportChanging()
+            suspendForecastCrossfade(on: mapView)
             syncControlsState(for: mapView)
-            scheduleVisibleTileSnapshot(for: mapView)
         }
 
         func mapView(
