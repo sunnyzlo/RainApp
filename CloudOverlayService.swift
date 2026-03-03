@@ -20,24 +20,43 @@ struct CloudOverlayService {
     }
 
     struct ForecastFrame {
+        struct LocalSignalSample {
+            let hasSignal: Bool
+            let red: Double
+            let green: Double
+            let blue: Double
+            let alpha: Double
+
+            static let none = LocalSignalSample(
+                hasSignal: false,
+                red: 0,
+                green: 0,
+                blue: 0,
+                alpha: 0
+            )
+        }
+
         let tileTemplate: String
         let time: Date
         let minZoom: Int
         let maxZoom: Int
         let hasLikelySignal: Bool
+        let localSignalSample: LocalSignalSample?
 
         init(
             tileTemplate: String,
             time: Date,
             minZoom: Int,
             maxZoom: Int,
-            hasLikelySignal: Bool = true
+            hasLikelySignal: Bool = true,
+            localSignalSample: LocalSignalSample? = nil
         ) {
             self.tileTemplate = tileTemplate
             self.time = time
             self.minZoom = minZoom
             self.maxZoom = maxZoom
             self.hasLikelySignal = hasLikelySignal
+            self.localSignalSample = localSignalSample
         }
     }
 
@@ -58,10 +77,11 @@ struct CloudOverlayService {
     static func fetchForecastFrame(
         targetDate: Date,
         near coordinate: CLLocationCoordinate2D? = nil,
-        probeSignalNearUser: Bool = true,
+        probeSignalNearUser: Bool = false,
         completion: @escaping (ForecastResult) -> Void
     ) {
         queue.async {
+            loadPersistentCacheIfNeeded()
             if
                 let cached = cachedAvailable,
                 Date().timeIntervalSince(cachedAt) < cacheTTL,
@@ -87,30 +107,65 @@ struct CloudOverlayService {
 
     // MARK: - Private
 
-    private struct AvailableResponse: Decodable {
+    private struct AvailableResponse: Codable {
         let minzoom: Int?
         let maxzoom: Int?
         let times: [TimeEntry]
 
-        struct TimeEntry: Decodable {
+        struct TimeEntry: Codable {
             let time: String
             let tiles: TileSet
         }
 
-        struct TileSet: Decodable {
+        struct TileSet: Codable {
             let png: String?
             let webp: String?
         }
     }
 
-    private static let endpoint = URL(string:
+    private static let defaultEndpoint = URL(string:
         "https://prod.yr-maps.met.no/api/precipitation-amount/available.json"
     )!
+    private static let backendBaseURL: URL? = {
+        guard
+            let raw = Bundle.main.object(
+                forInfoDictionaryKey: "RainBackendBaseURL"
+            ) as? String
+        else {
+            return nil
+        }
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, let url = URL(string: trimmed) else { return nil }
+        return url
+    }()
+    private static let backendStrictMode: Bool = {
+        if
+            let value = Bundle.main.object(
+                forInfoDictionaryKey: "RainBackendStrictMode"
+            ) as? Bool
+        {
+            return value
+        }
+        return true
+    }()
+    private static let preferWebPTiles: Bool = {
+        // MapKit tile overlays historically preferred PNG/JPEG, but modern iOS can decode WebP.
+        // Keep it opt-in so we can fall back quickly if MapKit rejects the format.
+        if
+            let value = Bundle.main.object(
+                forInfoDictionaryKey: "RainPreferWebPTiles"
+            ) as? Bool
+        {
+            return value
+        }
+        return false
+    }()
 
     private static let userAgent = "RainApp/1.0 (+https://github.com/alex/RainApp)"
     private static let queue = DispatchQueue(label: "CloudOverlayService.queue")
     private static let cacheTTL: TimeInterval = 2 * 60
-    private static let signalProbeCacheTTL: TimeInterval = 8 * 60
+    private static let persistentCacheKey = "rain.available.cache"
+    private static let persistentCacheTimeKey = "rain.available.cache.time"
     private static let networkSession: URLSession = {
         let config = URLSessionConfiguration.default
         config.httpMaximumConnectionsPerHost = 2
@@ -122,15 +177,53 @@ struct CloudOverlayService {
 
     private static var cachedAvailable: AvailableResponse?
     private static var cachedAt: Date = .distantPast
+    private static var persistentCacheLoaded = false
     private static var isFetchingAvailable = false
     private static var pendingRequests: [
         (Date, CLLocationCoordinate2D?, Bool, (ForecastResult) -> Void)
     ] = []
-    private static var signalProbeCache: [String: (value: Bool, at: Date)] = [:]
-    private static var signalTileCache: [String: (value: Bool, at: Date)] = [:]
-    private static var lastSignaledFrame: ForecastFrame?
 
     private static func fetchAvailable() {
+        let endpoints = availableEndpoints()
+        fetchAvailable(from: endpoints, index: 0, allowDefaultFallback: true)
+    }
+
+    private static func availableEndpoints() -> [URL] {
+        if let backendBaseURL {
+            let backendEndpoint = backendBaseURL.appendingPathComponent("v1/available")
+            if backendStrictMode {
+                return [backendEndpoint]
+            }
+            return [backendEndpoint, defaultEndpoint]
+        }
+        return [defaultEndpoint]
+    }
+
+    private static func fetchAvailable(
+        from endpoints: [URL],
+        index: Int,
+        allowDefaultFallback: Bool
+    ) {
+        guard index < endpoints.count else {
+            isFetchingAvailable = false
+            if cachedAvailable != nil {
+                print("☁️DBG available endpoint failed; using cached metadata (stale)")
+                flushPendingFromCache()
+                return
+            }
+            if allowDefaultFallback,
+               !backendStrictMode,
+               backendBaseURL != nil
+            {
+                print("☁️DBG available endpoint failed; trying upstream fallback")
+                fetchAvailable(from: [defaultEndpoint], index: 0, allowDefaultFallback: false)
+                return
+            }
+            flushPending(with: .failure("No available metadata endpoint responded"))
+            return
+        }
+
+        let endpoint = endpoints[index]
         var request = URLRequest(url: endpoint)
         request.timeoutInterval = 20
         request.setValue(userAgent, forHTTPHeaderField: "User-Agent")
@@ -138,30 +231,124 @@ struct CloudOverlayService {
 
         networkSession.dataTask(with: request) { data, response, error in
             queue.async {
-                isFetchingAvailable = false
-
                 if let error {
-                    flushPending(with: .failure("Network error: \(error.localizedDescription)"))
+                    _ = error
+                    print("☁️DBG available endpoint failed:", endpoint.absoluteString)
+                    fetchAvailable(from: endpoints, index: index + 1, allowDefaultFallback: allowDefaultFallback)
                     return
                 }
 
                 let statusCode = (response as? HTTPURLResponse)?.statusCode ?? -1
                 guard statusCode == 200, let data else {
-                    flushPending(with: .failure("HTTP \(statusCode)"))
+                    print(
+                        "☁️DBG available endpoint bad status:",
+                        endpoint.absoluteString,
+                        statusCode
+                    )
+                    fetchAvailable(from: endpoints, index: index + 1, allowDefaultFallback: allowDefaultFallback)
                     return
                 }
 
                 do {
-                    let available = try JSONDecoder().decode(AvailableResponse.self, from: data)
+                    let decoded = try JSONDecoder().decode(AvailableResponse.self, from: data)
+                    let baseURL = (response as? HTTPURLResponse)?.url ?? endpoint
+                    let available = normalizeAvailableResponse(
+                        decoded,
+                        responseURL: baseURL
+                    )
+                    let backendSource = endpoint.path.contains("/v1/available")
+                    print(
+                        "☁️DBG available endpoint ok:",
+                        backendSource ? "backend" : "upstream",
+                        endpoint.absoluteString
+                    )
                     cachedAvailable = available
                     cachedAt = Date()
+                    persistAvailableCache(available, cachedAt: cachedAt)
+                    isFetchingAvailable = false
                     flushPendingFromCache()
                 } catch {
-                    let bodyPrefix = String(decoding: data.prefix(180), as: UTF8.self)
-                    flushPending(with: .failure("Decode error: \(error.localizedDescription) | \(bodyPrefix)"))
+                    print("☁️DBG available endpoint decode failed:", endpoint.absoluteString)
+                    fetchAvailable(from: endpoints, index: index + 1, allowDefaultFallback: allowDefaultFallback)
                 }
             }
         }.resume()
+    }
+
+    private static func normalizeAvailableResponse(
+        _ available: AvailableResponse,
+        responseURL: URL
+    ) -> AvailableResponse {
+        let normalizedTimes = available.times.map { entry -> AvailableResponse.TimeEntry in
+            let normalizedTiles = AvailableResponse.TileSet(
+                png: normalizeTemplate(entry.tiles.png, responseURL: responseURL),
+                webp: normalizeTemplate(entry.tiles.webp, responseURL: responseURL)
+            )
+            return AvailableResponse.TimeEntry(
+                time: entry.time,
+                tiles: normalizedTiles
+            )
+        }
+        return AvailableResponse(
+            minzoom: available.minzoom,
+            maxzoom: available.maxzoom,
+            times: normalizedTimes
+        )
+    }
+
+    private static func loadPersistentCacheIfNeeded() {
+        guard !persistentCacheLoaded else { return }
+        persistentCacheLoaded = true
+        let defaults = UserDefaults.standard
+        // For local backend mode, avoid old on-disk metadata (vXX) mixing with current server state.
+        if backendBaseURL != nil {
+            defaults.removeObject(forKey: persistentCacheKey)
+            defaults.removeObject(forKey: persistentCacheTimeKey)
+            return
+        }
+        guard let data = defaults.data(forKey: persistentCacheKey) else { return }
+        guard let cachedTime = defaults.object(forKey: persistentCacheTimeKey) as? Date else { return }
+        do {
+            let decoded = try JSONDecoder().decode(AvailableResponse.self, from: data)
+            cachedAvailable = decoded
+            cachedAt = cachedTime
+            print("☁️DBG available cache loaded from disk")
+        } catch {
+            _ = error
+        }
+    }
+
+    private static func persistAvailableCache(
+        _ available: AvailableResponse,
+        cachedAt: Date
+    ) {
+        do {
+            let data = try JSONEncoder().encode(available)
+            let defaults = UserDefaults.standard
+            defaults.set(data, forKey: persistentCacheKey)
+            defaults.set(cachedAt, forKey: persistentCacheTimeKey)
+        } catch {
+            _ = error
+        }
+    }
+
+    private static func normalizeTemplate(
+        _ rawTemplate: String?,
+        responseURL: URL
+    ) -> String? {
+        guard let rawTemplate else { return nil }
+        let trimmed = rawTemplate.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        if URL(string: trimmed)?.scheme != nil {
+            return trimmed
+        }
+        guard let absolute = URL(
+            string: trimmed,
+            relativeTo: responseURL
+        )?.absoluteURL else {
+            return nil
+        }
+        return absolute.absoluteString
     }
 
     private static func flushPendingFromCache() {
@@ -212,7 +399,12 @@ struct CloudOverlayService {
         let maxZoom = max(minZoom, available.maxzoom ?? 6)
 
         let parsed: [ForecastFrame] = available.times.compactMap { entry in
-            let template = entry.tiles.png ?? entry.tiles.webp
+            let template: String? = {
+                if preferWebPTiles {
+                    return entry.tiles.webp ?? entry.tiles.png
+                }
+                return entry.tiles.png ?? entry.tiles.webp
+            }()
             guard let template else { return nil }
             guard let time = parseISODate(entry.time) else { return nil }
             return ForecastFrame(
@@ -226,336 +418,71 @@ struct CloudOverlayService {
         let frames = parsed.sorted(by: { $0.time < $1.time })
         guard !frames.isEmpty else { return nil }
 
-        guard let selected = (frames
-            .filter({ $0.time >= targetDate })
-            .min(by: { $0.time < $1.time })) ?? frames.max(by: { $0.time < $1.time })
-        else {
-            return nil
-        }
-
-        guard probeSignalNearUser, let coordinate else {
-            return selected
-        }
-
-        guard let selectedIndex = frames.firstIndex(where: { $0.time == selected.time }) else {
-            return selected
-        }
-
-        // If chosen frame is locally empty around user, pick nearest neighbor with signal.
-        let maxStep = min(6, max(0, frames.count - 1))
-        var candidateIndices: [Int] = [selectedIndex]
-        if maxStep > 0 {
-            for step in 1...maxStep {
-                let future = selectedIndex + step
-                if future < frames.count {
-                    candidateIndices.append(future)
-                }
-                let past = selectedIndex - step
-                if past >= 0 {
-                    candidateIndices.append(past)
-                }
+        // Prefer stepping through the available frame list based on the user's
+        // time-wheel offset, rather than strictly picking the first frame >= targetDate.
+        //
+        // Reason: depending on upstream/backend availability windows, all wheel hours can
+        // map to the same earliest-available frame, making the overlay look "stuck".
+        let now = Date()
+        let calendar = Calendar.current
+        let nowHourStart = calendar.date(
+            bySettingHour: calendar.component(.hour, from: now),
+            minute: 0,
+            second: 0,
+            of: now
+        ) ?? now
+        let baseIndex: Int = {
+            if let idx = frames.firstIndex(where: { $0.time >= nowHourStart }) {
+                return idx
             }
-        }
-
-        for idx in candidateIndices {
-            let frame = frames[idx]
-            if hasLikelySignal(frame: frame, near: coordinate) {
-                lastSignaledFrame = frame
-                if idx != selectedIndex {
-                    let fromHour = Int(selected.time.timeIntervalSince1970 / 3600)
-                    let toHour = Int(frame.time.timeIntervalSince1970 / 3600)
-                    print("☁️ Frame fallback:", fromHour, "->", toHour)
-                }
-                return frame
+            return max(0, frames.count - 1)
+        }()
+        let stepSeconds: TimeInterval = {
+            guard frames.count >= 3 else { return 5 * 60 }
+            var deltas: [TimeInterval] = []
+            deltas.reserveCapacity(frames.count - 1)
+            for i in 1..<frames.count {
+                let d = frames[i].time.timeIntervalSince(frames[i - 1].time)
+                if d > 0 { deltas.append(d) }
             }
-        }
-
-        if let reused = lastSignaledFrame {
-            let fromHour = Int(selected.time.timeIntervalSince1970 / 3600)
-            let toHour = Int(reused.time.timeIntervalSince1970 / 3600)
-            print("☁️ Frame fallback: reuse", fromHour, "->", toHour)
-            return reused
-        }
-
-        let selectedHour = Int(selected.time.timeIntervalSince1970 / 3600)
-        print("☁️ Frame fallback: none for", selectedHour)
-        return ForecastFrame(
-            tileTemplate: selected.tileTemplate,
-            time: selected.time,
-            minZoom: selected.minZoom,
-            maxZoom: selected.maxZoom,
-            hasLikelySignal: false
+            guard !deltas.isEmpty else { return 5 * 60 }
+            deltas.sort()
+            let median = deltas[deltas.count / 2]
+            // Keep step within reasonable bounds to avoid wild jumps.
+            return min(60 * 60, max(60, median))
+        }()
+        let framesPerHour = max(1, Int((3600.0 / max(1.0, stepSeconds)).rounded()))
+        // Align offsets to hour buckets (current hour + N), not to raw "now" minutes.
+        // This avoids negative offset at startup when current minutes > 30.
+        let offsetHours = calendar.dateComponents([.hour], from: nowHourStart, to: targetDate).hour ?? 0
+        let desiredIndex = min(
+            max(0, baseIndex + offsetHours * framesPerHour),
+            frames.count - 1
         )
-    }
+        let selected = frames[desiredIndex]
 
-    private static func hasLikelySignal(
-        frame: ForecastFrame,
-        near coordinate: CLLocationCoordinate2D
-    ) -> Bool {
-        let cacheKey = "\(frame.tileTemplate)|\(frame.maxZoom)|\(coordinate.latitude)|\(coordinate.longitude)"
-        if let cached = signalProbeCache[cacheKey],
-           Date().timeIntervalSince(cached.at) < signalProbeCacheTTL
-        {
-            return cached.value
-        }
-
-        guard let tile = tileForCoordinate(coordinate, zoom: frame.maxZoom) else {
-            return true
-        }
-        let result = hasSignalAroundTile(
-            frame: frame,
-            tile: tile,
-            zoom: frame.maxZoom
+#if DEBUG
+        let stamp = selected.tileTemplate
+            .split(separator: "/")
+            .first(where: { $0.count == 12 && $0.allSatisfy(\.isNumber) })
+            .map(String.init) ?? "?"
+        print(
+            "☁️DBG pickFrame",
+            "frames=\(frames.count)",
+            "base=\(baseIndex)",
+            "step=\(Int(stepSeconds))s",
+            "fph=\(framesPerHour)",
+            "offH=\(offsetHours)",
+            "idx=\(desiredIndex)",
+            "stamp=\(stamp)"
         )
-        signalProbeCache[cacheKey] = (result, Date())
-        return result
-    }
+#endif
 
-    private static func hasSignalAroundTile(
-        frame: ForecastFrame,
-        tile: (x: Int, y: Int, px: Int, py: Int),
-        zoom: Int
-    ) -> Bool {
-        let n = 1 << zoom
-        let offsets: [(Int, Int)] = [
-            (0, 0),
-            (1, 0), (-1, 0), (0, 1), (0, -1),
-            (1, 1), (-1, 1), (1, -1), (-1, -1)
-        ]
-
-        for (dx, dy) in offsets {
-            var probeX = tile.x + dx
-            var probeY = tile.y + dy
-            if probeY < 0 || probeY >= n { continue }
-            probeX = ((probeX % n) + n) % n
-
-            guard let url = makeTileURL(
-                template: frame.tileTemplate,
-                z: zoom,
-                x: probeX,
-                y: probeY
-            ) else {
-                continue
-            }
-
-            let isCenterTile = (dx == 0 && dy == 0)
-            var remoteHasSignal = fetchSignalProbe(
-                url: url,
-                samplePoint: isCenterTile ? (x: tile.px, y: tile.py) : nil
-            )
-            if !remoteHasSignal && isCenterTile {
-                // Center sample can miss nearby precip inside same tile.
-                remoteHasSignal = fetchSignalProbe(url: url, samplePoint: nil)
-            }
-
-            if remoteHasSignal { return true }
-        }
-
-        return false
-    }
-
-    private static func fetchSignalProbe(
-        url: URL,
-        samplePoint: (x: Int, y: Int)?
-    ) -> Bool {
-        let cacheKey = "\(url.absoluteString)|\(samplePoint?.x ?? -1)|\(samplePoint?.y ?? -1)"
-        if let cached = signalTileCache[cacheKey],
-           Date().timeIntervalSince(cached.at) < signalProbeCacheTTL
-        {
-            return cached.value
-        }
-
-        var request = URLRequest(url: url)
-        request.timeoutInterval = 7
-        request.setValue(userAgent, forHTTPHeaderField: "User-Agent")
-        request.setValue("image/png,image/*;q=0.9,*/*;q=0.5", forHTTPHeaderField: "Accept")
-
-        let semaphore = DispatchSemaphore(value: 0)
-        // Be conservative: failed probes should not force switching to empty frames.
-        var result = false
-
-        networkSession.dataTask(with: request) { data, response, _ in
-            defer { semaphore.signal() }
-            let status = (response as? HTTPURLResponse)?.statusCode ?? -1
-            guard status == 200, let data else {
-                result = false
-                return
-            }
-
-            if let samplePoint {
-                result = tileHasSignal(data: data, at: samplePoint)
-            } else {
-                result = tileHasSignalAnywhere(data: data)
-            }
-        }.resume()
-
-        _ = semaphore.wait(timeout: .now() + 8)
-        signalTileCache[cacheKey] = (result, Date())
-        return result
-    }
-
-    private static func tileHasSignal(
-        data: Data,
-        at sample: (x: Int, y: Int)
-    ) -> Bool {
-        guard let imageSource = CGImageSourceCreateWithData(data as CFData, nil) else {
-            return true
-        }
-        guard let image = CGImageSourceCreateImageAtIndex(imageSource, 0, nil) else {
-            return true
-        }
-
-        let width = image.width
-        let height = image.height
-        guard width > 1, height > 1 else { return true }
-
-        let bitmapInfo =
-            CGImageAlphaInfo.premultipliedLast.rawValue |
-            CGBitmapInfo.byteOrder32Big.rawValue
-
-        guard let context = CGContext(
-            data: nil,
-            width: width,
-            height: height,
-            bitsPerComponent: 8,
-            bytesPerRow: 0,
-            space: CGColorSpaceCreateDeviceRGB(),
-            bitmapInfo: bitmapInfo
-        ) else {
-            return true
-        }
-
-        context.clear(CGRect(x: 0, y: 0, width: width, height: height))
-        context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
-        guard let bytes = context.data else { return true }
-        let ptr = bytes.bindMemory(to: UInt8.self, capacity: width * height * 4)
-
-        let centerX = max(0, min(width - 1, sample.x))
-        let centerY = max(0, min(height - 1, sample.y))
-        let radius = max(10, min(width, height) / 9)
-        let minX = max(0, centerX - radius)
-        let maxX = min(width - 1, centerX + radius)
-        let minY = max(0, centerY - radius)
-        let maxY = min(height - 1, centerY + radius)
-
-        var coloredPixels = 0
-        for y in minY...maxY {
-            for x in minX...maxX {
-                let idx = (y * width + x) * 4
-                let alpha = Int(ptr[idx + 3])
-                if alpha < 3 { continue }
-
-                let r = Double(ptr[idx])
-                let g = Double(ptr[idx + 1])
-                let b = Double(ptr[idx + 2])
-
-                // Black-ish pixel means no precipitation signal in yr tiles.
-                if r <= 12.0 && g <= 12.0 && b <= 18.0 { continue }
-                let brightness = max(r, max(g, b)) / 255.0
-                if brightness < 0.16 { continue }
-                coloredPixels += 1
-                if coloredPixels >= 12 { return true }
-            }
-        }
-        return false
-    }
-
-    private static func tileHasSignalAnywhere(data: Data) -> Bool {
-        guard let imageSource = CGImageSourceCreateWithData(data as CFData, nil) else {
-            return true
-        }
-        guard let image = CGImageSourceCreateImageAtIndex(imageSource, 0, nil) else {
-            return true
-        }
-
-        let width = image.width
-        let height = image.height
-        guard width > 1, height > 1 else { return true }
-
-        let bitmapInfo =
-            CGImageAlphaInfo.premultipliedLast.rawValue |
-            CGBitmapInfo.byteOrder32Big.rawValue
-
-        guard let context = CGContext(
-            data: nil,
-            width: width,
-            height: height,
-            bitsPerComponent: 8,
-            bytesPerRow: 0,
-            space: CGColorSpaceCreateDeviceRGB(),
-            bitmapInfo: bitmapInfo
-        ) else {
-            return true
-        }
-
-        context.clear(CGRect(x: 0, y: 0, width: width, height: height))
-        context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
-        guard let bytes = context.data else { return true }
-        let ptr = bytes.bindMemory(to: UInt8.self, capacity: width * height * 4)
-
-        var coloredPixels = 0
-        let step = max(1, min(width, height) / 40)
-        for y in stride(from: 0, to: height, by: step) {
-            for x in stride(from: 0, to: width, by: step) {
-                let idx = (y * width + x) * 4
-                let alpha = Int(ptr[idx + 3])
-                if alpha < 3 { continue }
-
-                let r = Double(ptr[idx])
-                let g = Double(ptr[idx + 1])
-                let b = Double(ptr[idx + 2])
-
-                if r <= 12.0 && g <= 12.0 && b <= 18.0 { continue }
-                let brightness = max(r, max(g, b)) / 255.0
-                if brightness < 0.16 { continue }
-                coloredPixels += 1
-                if coloredPixels >= 8 { return true }
-            }
-        }
-
-        return false
-    }
-
-    private static func tileForCoordinate(
-        _ coordinate: CLLocationCoordinate2D,
-        zoom: Int
-    ) -> (x: Int, y: Int, px: Int, py: Int)? {
-        guard zoom >= 0 else { return nil }
-        let lat = max(-85.05112878, min(85.05112878, coordinate.latitude))
-        let lon = coordinate.longitude
-        let scale = pow(2.0, Double(zoom))
-
-        let xFloat = (lon + 180.0) / 360.0 * scale
-        let latRad = lat * .pi / 180.0
-        let mercN = log(tan(.pi / 4.0 + latRad / 2.0))
-        let yFloat = (1.0 - mercN / .pi) / 2.0 * scale
-
-        let tileX = Int(floor(xFloat))
-        let tileY = Int(floor(yFloat))
-        let fracX = xFloat - floor(xFloat)
-        let fracY = yFloat - floor(yFloat)
-        let pixelX = Int((fracX * 256.0).rounded())
-        let pixelY = Int((fracY * 256.0).rounded())
-
-        return (
-            x: max(0, tileX),
-            y: max(0, tileY),
-            px: max(0, min(255, pixelX)),
-            py: max(0, min(255, pixelY))
-        )
-    }
-
-    private static func makeTileURL(
-        template: String,
-        z: Int,
-        x: Int,
-        y: Int
-    ) -> URL? {
-        let urlString = template
-            .replacingOccurrences(of: "{z}", with: "\(z)")
-            .replacingOccurrences(of: "{x}", with: "\(x)")
-            .replacingOccurrences(of: "{y}", with: "\(y)")
-        return URL(string: urlString)
+        _ = coordinate
+        _ = probeSignalNearUser
+        // Always use the precipitation frame directly.
+        // Local pixel probing adds latency and can suppress valid rain coverage.
+        return selected
     }
 
     private static func parseISODate(_ raw: String) -> Date? {

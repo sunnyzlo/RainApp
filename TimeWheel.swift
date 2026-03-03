@@ -3,9 +3,13 @@ import Combine
 
 struct TimeWheel: View {
 
+    private static let slotCount = 12 // now + next 11 hours (was 7)
+
     @Binding var selectedHour: Int
     var isDarkTheme: Bool = true
-    var rainIntensityByHour: [Int: Double] = [:]
+    var cloudDotColorByHour: [Int: Color] = [:]
+    @Binding var isScrubbing: Bool
+    var embeddedInContainer: Bool = false
 
     @State private var dragOffset: CGFloat = 0
     @State private var dragStartIndex: Int?
@@ -14,252 +18,123 @@ struct TimeWheel: View {
 
     private var hours: [Int] {
         let nowHour = Calendar.current.component(.hour, from: now)
-        return (0..<7).map { (nowHour + $0) % 24 }
+        return (0..<Self.slotCount).map { (nowHour + $0) % 24 }
     }
 
     var body: some View {
 
         GeometryReader { geo in
 
-            let horizontalInset: CGFloat = 24
-            let trackHeight: CGFloat = 60
-            let bubbleHeight: CGFloat = 50
-            let cellWidth =
-                (geo.size.width - horizontalInset * 2)
+            let horizontalInset: CGFloat = 20
+            let trackHeight: CGFloat = 48
+            let bubbleHeight: CGFloat = 38
+            let firstCellExtraWidth: CGFloat = 20
+            let contentWidth = max(1, geo.size.width - horizontalInset * 2)
+            let baseCellWidth =
+                (contentWidth - firstCellExtraWidth)
                 / CGFloat(hours.count)
-            let bubbleWidth = max(66, cellWidth + 16)
+            let slotWidths = hours.enumerated().map { index, _ in
+                index == 0 ? (baseCellWidth + firstCellExtraWidth) : baseCellWidth
+            }
+            let slotCenters: [CGFloat] = {
+                var centers: [CGFloat] = []
+                var x: CGFloat = 0
+                for width in slotWidths {
+                    centers.append(x + width / 2)
+                    x += width
+                }
+                return centers
+            }()
             let activeHour = previewHour ?? selectedHour
-            let isScrubbing = dragStartIndex != nil || abs(dragOffset) > 0.5
-            let dragProgress = min(1, abs(dragOffset) / max(1, cellWidth * 0.28))
+            let isScrubbingActive = dragStartIndex != nil || abs(dragOffset) > 0.5
+            let dragProgress = min(1, abs(dragOffset) / max(1, baseCellWidth * 0.28))
             let dragDirection: CGFloat = dragOffset == 0 ? 0 : (dragOffset > 0 ? 1 : -1)
             let dragEnergy = CGFloat(pow(Double(dragProgress), 0.72))
-            let rainBySlot = hours.map { max(0, rainIntensityByHour[$0] ?? 0) }
-            let hourFont = Font.system(size: 18, weight: .bold, design: .rounded)
+            let hourFont = Font.system(size: 14, weight: .semibold, design: .rounded)
+            let bubbleWidth = max(50, baseCellWidth + 6)
+            let activeIndex = max(0, hours.firstIndex(of: activeHour) ?? 0)
+            let activeCenter = slotCenters[min(activeIndex, max(0, slotCenters.count - 1))]
+            let centerOffset = contentWidth / 2
+            let cloudDotColors = hours.map { cloudDotColorByHour[$0] }
 
             ZStack {
 
-                // Track: native material/glass stack (tab-bar like)
-                Capsule()
-                    .fill(.ultraThinMaterial)
-                    .overlay(
-                        Capsule()
-                            .fill(
-                                isDarkTheme
-                                    ? Color.black.opacity(0.26)
-                                    : Color.white.opacity(0.28)
-                            )
-                    )
-                    .overlay(
-                        Capsule()
-                            .stroke(
-                                LinearGradient(
-                                    colors: isDarkTheme
-                                        ? [
-                                            Color.white.opacity(0.36),
-                                            Color.white.opacity(0.08)
-                                        ]
-                                        : [
-                                            Color.white.opacity(0.75),
-                                            Color.black.opacity(0.12)
-                                        ],
-                                    startPoint: .topLeading,
-                                    endPoint: .bottomTrailing
-                                ),
-                                lineWidth: 1
-                            )
-                    )
-                    .background(
-                        Capsule()
-                            .fill(
-                                isDarkTheme
-                                    ? .black.opacity(0.32)
-                                    : .white.opacity(0.34)
-                            )
-                            .blur(radius: 24)
-                    )
-                    .overlay(
-                        Capsule()
-                            .fill(
-                                LinearGradient(
-                                    colors: [
-                                        .white.opacity(isDarkTheme ? 0.18 : 0.32),
-                                        .clear
-                                    ],
-                                    startPoint: .top,
-                                    endPoint: .bottom
+                if !embeddedInContainer {
+                    Group {
+                        if #available(iOS 26.0, *) {
+                            Capsule()
+                                .fill(isDarkTheme ? .clear : Color.black.opacity(0.08))
+                                .glassEffect(.regular)
+                                .overlay(
+                                    Capsule()
+                                        .stroke(.white.opacity(isDarkTheme ? 0.22 : 0.12), lineWidth: 1)
                                 )
-                            )
-                            .padding(1.5)
-                    )
+                        } else {
+                            Capsule()
+                                .fill(.ultraThinMaterial)
+                        }
+                    }
                     .frame(height: trackHeight)
                     .frame(maxWidth: .infinity)
+                }
 
                 // Active bubble:
-                // idle => simple gray fill
-                // scrubbing => liquid glass + edge distortion
                 ZStack {
-                    if isScrubbing {
-                        Capsule()
-                            .glassEffect(.regular.interactive())
-                            .overlay(
-                                Capsule()
-                                    .stroke(.white.opacity(isDarkTheme ? 0.34 : 0.58), lineWidth: 0.9)
-                            )
-                            .overlay(
-                                Capsule()
-                                    .fill(
-                                        RadialGradient(
-                                            colors: [
-                                                .white.opacity(isDarkTheme ? 0.26 : 0.42),
-                                                .clear
-                                            ],
-                                            center: .top,
-                                            startRadius: 2,
-                                            endRadius: 34
-                                        )
-                                    )
-                                    .padding(2)
-                            )
-                            .overlay(
-                                Capsule()
-                                    .fill(
-                                        LinearGradient(
-                                            colors: [
-                                                .clear,
-                                                .cyan.opacity(isDarkTheme ? 0.34 : 0.40),
-                                                .yellow.opacity(isDarkTheme ? 0.24 : 0.32),
-                                                .clear
-                                            ],
-                                            startPoint: .leading,
-                                            endPoint: .trailing
-                                        )
-                                    )
-                                    .blur(radius: 16)
-                                    .opacity(1.0 * dragEnergy)
-                                    .offset(x: dragDirection * 30 * dragEnergy)
-                                    .mask(
-                                        Capsule()
-                                            .stroke(lineWidth: 10)
-                                    )
-                            )
-                            .overlay(
-                                Capsule()
-                                    .fill(
-                                        LinearGradient(
-                                            colors: [
-                                                .clear,
-                                                .white.opacity(isDarkTheme ? 0.28 : 0.44),
-                                                .clear
-                                            ],
-                                            startPoint: .top,
-                                            endPoint: .bottom
-                                        )
-                                    )
-                                    .blur(radius: 13)
-                                    .opacity(0.92 * dragEnergy)
-                                    .offset(
-                                        x: -dragDirection * 17 * dragEnergy,
-                                        y: 5 * dragEnergy
-                                    )
-                                    .mask(
-                                        Capsule()
-                                            .stroke(lineWidth: 8)
-                                    )
-                            )
-                            .overlay(
-                                HStack(spacing: 0) {
-                                    Circle()
-                                        .fill(
-                                            AngularGradient(
-                                                colors: [
-                                                    .clear,
-                                                    .red.opacity(isDarkTheme ? 0.92 : 0.84),
-                                                    .orange.opacity(isDarkTheme ? 0.76 : 0.68),
-                                                    .cyan.opacity(isDarkTheme ? 0.90 : 0.84),
-                                                    .blue.opacity(isDarkTheme ? 0.90 : 0.86),
-                                                    .clear
-                                                ],
-                                                center: .center
-                                            )
-                                        )
-                                        .frame(width: bubbleHeight * 0.88, height: bubbleHeight * 0.98)
-                                        .blur(radius: 9)
-                                        .saturation(1.7)
-                                        .offset(
-                                            x: -20 - 18 * dragEnergy,
-                                            y: -2 - 3 * dragEnergy
-                                        )
-                                    Spacer(minLength: 0)
-                                    Circle()
-                                        .fill(
-                                            AngularGradient(
-                                                colors: [
-                                                    .clear,
-                                                    .blue.opacity(isDarkTheme ? 0.95 : 0.90),
-                                                    .cyan.opacity(isDarkTheme ? 0.88 : 0.82),
-                                                    .yellow.opacity(isDarkTheme ? 0.74 : 0.68),
-                                                    .red.opacity(isDarkTheme ? 0.90 : 0.82),
-                                                    .clear
-                                                ],
-                                                center: .center
-                                            )
-                                        )
-                                        .frame(width: bubbleHeight * 0.88, height: bubbleHeight * 0.98)
-                                        .blur(radius: 9)
-                                        .saturation(1.7)
-                                        .offset(
-                                            x: 20 + 18 * dragEnergy,
-                                            y: -2 - 3 * dragEnergy
-                                        )
-                                }
-                                .padding(.horizontal, -20)
-                                .opacity(1.0 * dragEnergy)
-                                .mask(
-                                    Capsule()
-                                        .stroke(lineWidth: 14)
+                    Group {
+                        if #available(iOS 26.0, *) {
+                            Capsule()
+                                .fill(
+                                    isDarkTheme
+                                        ? Color.white.opacity(isScrubbingActive ? 0.16 : 0.24)
+                                        : Color.black.opacity(isScrubbingActive ? 0.16 : 0.26)
                                 )
-                            )
-                    } else {
-                        Capsule()
-                            .fill(
-                                isDarkTheme
-                                    ? Color.white.opacity(0.16)
-                                    : Color.gray.opacity(0.24)
-                            )
-                            .overlay(
-                                Capsule()
-                                    .stroke(
-                                        isDarkTheme
-                                            ? .white.opacity(0.30)
-                                            : .black.opacity(0.16),
-                                        lineWidth: 0.9
-                                    )
-                            )
+                                .glassEffect(isScrubbingActive ? .regular.interactive() : .regular)
+                                .overlay(
+                                    Capsule()
+                                        .stroke(.white.opacity(isScrubbingActive ? 0.24 : 0.0), lineWidth: 1)
+                                )
+                        } else {
+                            Capsule()
+                                .fill(
+                                    isDarkTheme
+                                        ? Color.white.opacity(isScrubbingActive ? 0.20 : 0.24)
+                                        : Color.black.opacity(isScrubbingActive ? 0.20 : 0.26)
+                                )
+                                .overlay(
+                                    Capsule()
+                                        .stroke(
+                                            isDarkTheme
+                                                ? .white.opacity(isScrubbingActive ? 0.22 : 0.0)
+                                                : .black.opacity(isScrubbingActive ? 0.18 : 0.0),
+                                            lineWidth: 1
+                                        )
+                                )
+                        }
                     }
                 }
                 .frame(width: bubbleWidth, height: bubbleHeight)
                 .padding(.horizontal, 6)
                 .offset(
-                    x: highlightOffset(cellWidth, activeHour: activeHour)
+                    x: activeCenter - centerOffset
                 )
                 .scaleEffect(
-                    x: 1 + 0.14 * dragEnergy,
-                    y: 1 - 0.08 * dragEnergy
+                    x: 1 + 0.08 * dragEnergy,
+                    y: 1 - 0.04 * dragEnergy
                 )
-                .rotationEffect(.degrees(Double(dragDirection * dragEnergy * 2.8)))
+                .rotationEffect(.degrees(Double(dragDirection * dragEnergy * 1.2)))
                 .animation(.interactiveSpring(response: 0.28, dampingFraction: 0.84), value: activeHour)
 
                 // HOURS
                 HStack(spacing: 0) {
                     ForEach(Array(hours.enumerated()), id: \.offset) { index, hour in
-                        Text(index == 0 ? Self.nowTimeFormatter.string(from: now) : "\(hour)")
+                        Text(index == 0 ? "Now" : "\(hour)")
                             .font(hourFont)
                             .monospacedDigit()
                             .foregroundStyle(isDarkTheme ? Color.white : Color.black)
                             .opacity(hour == activeHour ? 1 : 0.55)
                             .lineLimit(1)
-                            .minimumScaleFactor(0.62)
-                            .frame(width: cellWidth)
+                            .minimumScaleFactor(0.9)
+                            .frame(width: slotWidths[index])
                             .contentShape(Rectangle())
                             .onTapGesture {
                                 select(hour)
@@ -270,9 +145,9 @@ struct TimeWheel: View {
                 .frame(maxWidth: .infinity)
 
                 rainLineOverlay(
-                    rainBySlot: rainBySlot,
+                    cloudDotColors: cloudDotColors,
                     horizontalInset: horizontalInset,
-                    cellWidth: cellWidth,
+                    slotWidths: slotWidths,
                     trackHeight: trackHeight
                 )
 
@@ -284,6 +159,7 @@ struct TimeWheel: View {
                     .onChanged { value in
 
                         dragOffset = value.translation.width
+                        isScrubbing = true
 
                         // ⭐ фиксируем старт только один раз
                         if dragStartIndex == nil {
@@ -293,12 +169,13 @@ struct TimeWheel: View {
 
                         guard let startIndex = dragStartIndex else { return }
 
-                        let shift =
-                            Int(round(dragOffset / cellWidth))
+                        let startCenter = slotCenters[startIndex]
+                        let projectedCenter = startCenter + dragOffset
+                        let nearestIndex = slotCenters.enumerated().min(by: { lhs, rhs in
+                            abs(lhs.element - projectedCenter) < abs(rhs.element - projectedCenter)
+                        })?.offset ?? startIndex
 
-                        let newIndex =
-                            (startIndex + shift)
-                                .clamped(to: 0...hours.count-1)
+                        let newIndex = nearestIndex.clamped(to: 0...hours.count-1)
 
                         let newHour = hours[newIndex]
                         previewHour = newHour
@@ -306,13 +183,15 @@ struct TimeWheel: View {
                         // Apply immediately while scrubbing, without waiting for finger release.
                         if newHour != selectedHour {
                             selectedHour = newHour
-                            UIImpactFeedbackGenerator(style: .light).impactOccurred()
                         }
                     }
 
                     .onEnded { _ in
                         dragStartIndex = nil
                         previewHour = nil
+                        isScrubbing = false
+
+                        UIImpactFeedbackGenerator(style: .light).impactOccurred()
 
                         withAnimation(.interactiveSpring(
                             response: 0.35,
@@ -323,7 +202,7 @@ struct TimeWheel: View {
                     }
             )
         }
-        .frame(height: 64)
+        .frame(height: 50)
         .onReceive(Self.clockTimer) { value in
             now = value
             if !hours.contains(selectedHour) {
@@ -337,15 +216,6 @@ struct TimeWheel: View {
                 selectedHour = hours.first ?? 0
             }
         }
-    }
-
-    private func highlightOffset(_ width: CGFloat, activeHour: Int) -> CGFloat {
-
-        guard let index = hours.firstIndex(of: activeHour)
-        else { return 0 }
-
-        return CGFloat(index) * width
-            - width * CGFloat(hours.count - 1) / 2
     }
 
     private func select(_ hour: Int) {
@@ -363,68 +233,6 @@ struct TimeWheel: View {
         }
     }
 
-    @ViewBuilder
-    private func rainLineOverlay(
-        rainBySlot: [Double],
-        horizontalInset: CGFloat,
-        cellWidth: CGFloat,
-        trackHeight: CGFloat
-    ) -> some View {
-        let rainyThreshold = 0.02
-        let dotY: CGFloat = 7.5
-
-        Canvas { context, _ in
-            func normalize(_ intensity: Double) -> CGFloat {
-                min(1.0, max(0.0, intensity / 3.0))
-            }
-
-            func lerp(_ a: CGFloat, _ b: CGFloat, _ t: CGFloat) -> CGFloat {
-                a + (b - a) * t
-            }
-
-            func rainDotColor(_ normalized: CGFloat) -> Color {
-                if isDarkTheme {
-                    return Color(
-                        red: lerp(0.24, 0.05, normalized),
-                        green: lerp(0.66, 0.30, normalized),
-                        blue: lerp(1.00, 0.78, normalized)
-                    )
-                }
-                return Color(
-                    red: lerp(0.20, 0.04, normalized),
-                    green: lerp(0.62, 0.34, normalized),
-                    blue: lerp(0.98, 0.82, normalized)
-                )
-            }
-
-            func x(_ index: Int) -> CGFloat {
-                horizontalInset + CGFloat(index) * cellWidth + cellWidth / 2
-            }
-
-            for index in rainBySlot.indices {
-                let intensity = rainBySlot[index]
-                guard intensity > rainyThreshold else { continue }
-
-                let normalized = normalize(intensity)
-                let dotRadius = 2.8 + normalized * 3.0
-                let center = CGPoint(x: x(index), y: dotY)
-                let dotRect = CGRect(
-                    x: center.x - dotRadius,
-                    y: center.y - dotRadius,
-                    width: dotRadius * 2,
-                    height: dotRadius * 2
-                )
-                let color = rainDotColor(normalized)
-
-                var dot = Path()
-                dot.addEllipse(in: dotRect)
-                context.fill(dot, with: .color(color.opacity(0.96)))
-            }
-        }
-        .frame(height: trackHeight)
-        .allowsHitTesting(false)
-    }
-
     private static let nowTimeFormatter: DateFormatter = {
         let formatter = DateFormatter()
         formatter.dateFormat = "HH:mm"
@@ -438,6 +246,49 @@ struct TimeWheel: View {
         on: .main,
         in: .common
     ).autoconnect()
+}
+
+extension TimeWheel {
+    @ViewBuilder
+    private func rainLineOverlay(
+        cloudDotColors: [Color?],
+        horizontalInset: CGFloat,
+        slotWidths: [CGFloat],
+        trackHeight: CGFloat
+    ) -> some View {
+        let dotY: CGFloat = 7.5
+
+        Canvas { context, _ in
+            func x(_ index: Int) -> CGFloat {
+                let before = slotWidths.prefix(index).reduce(0, +)
+                return horizontalInset + before + slotWidths[index] / 2
+            }
+
+            for index in cloudDotColors.indices {
+                guard let color = cloudDotColors[index] else { continue }
+
+                let dotRadius: CGFloat = 3.6
+                let center = CGPoint(x: x(index), y: dotY)
+                let dotRect = CGRect(
+                    x: center.x - dotRadius,
+                    y: center.y - dotRadius,
+                    width: dotRadius * 2,
+                    height: dotRadius * 2
+                )
+
+                var dot = Path()
+                dot.addEllipse(in: dotRect)
+                context.fill(dot, with: .color(color))
+                context.stroke(
+                    dot,
+                    with: .color(isDarkTheme ? .black.opacity(0.22) : .black.opacity(0.18)),
+                    lineWidth: 0.9
+                )
+            }
+        }
+        .frame(height: trackHeight)
+        .allowsHitTesting(false)
+    }
 }
 
 extension Comparable {

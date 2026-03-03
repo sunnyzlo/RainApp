@@ -7,9 +7,12 @@
 
 import SwiftUI
 import SwiftData
+import CoreLocation
 
 @main
 struct RainAppApp: App {
+    @State private var selectedHour = Calendar.current.component(.hour, from: Date())
+
     var sharedModelContainer: ModelContainer = {
         let schema = Schema([
             Item.self,
@@ -25,8 +28,17 @@ struct RainAppApp: App {
 
     var body: some Scene {
         WindowGroup {
-            ContentView()
+            ContentView(selectedHour: $selectedHour)
         }
         .modelContainer(sharedModelContainer)
+    }
+}
+
+final class PushNotificationService {
+    static let shared = PushNotificationService()
+    private init() {}
+
+    func registerDeviceIfPossible(location: CLLocation) {
+        // Old ContentView expects this API; keep as no-op in this snapshot mix.
     }
 }

@@ -1400,8 +1400,8 @@ struct UIKitMap: UIViewRepresentable {
                 }
                 return (data, reason)
             }
-            let isMediumZoom = requested.z >= 4 && requested.z <= 8
-            let allowStickyFallback = !isMediumZoom && requested.z <= 7
+            let previousFrameFallbackMaxAge: TimeInterval = 1.8
+            let allowStickyFallback = requested.z <= 7
             let resolveStickyFallback: () -> (Data, String)? = {
                 if allowStickyFallback,
                    let sticky = Self.freshStickyTile(key: stickyKey)
@@ -1410,10 +1410,23 @@ struct UIKitMap: UIViewRepresentable {
                 }
                 return nil
             }
-            let allowStickyCompositeFallback = !isMediumZoom && requested.z <= 7
+            let allowStickyCompositeFallback = requested.z <= 7
             let resolveCachedFallback: () -> (Data, String)? = {
                 if let resolved = resolveVisibleRenderedCache(fallbackKey, "current-fallback") {
                     return resolved
+                }
+                if let fallbackTemplate,
+                   requested.z >= 4, requested.z <= 8,
+                   Date().timeIntervalSince1970 - self.stateQueue.sync(execute: { self.fallbackTemplateSetAt }) <= previousFrameFallbackMaxAge,
+                   sourceZ < requested.z
+                {
+                    let previousFrameKey = Self.tileCacheKey(
+                        template: fallbackTemplate,
+                        requested: requested
+                    )
+                    if let resolved = resolveVisibleRenderedCache(previousFrameKey, "previous-frame") {
+                        return resolved
+                    }
                 }
                 if let composite = self.childCompositeFallbackTile(
                     template: template,
@@ -1623,9 +1636,7 @@ struct UIKitMap: UIViewRepresentable {
                         result(cached, nil)
                         return
                     }
-                    if allowStickyFallback,
-                       let sticky = Self.freshStickyTile(key: stickyKey)
-                    {
+                    if let sticky = Self.freshStickyTile(key: stickyKey) {
                         if Self.shouldSample(requested) {
                             print("☁️ tile fallback: sticky reason:low-visible-drop \(rendered.visiblePixelCount)")
                         }
@@ -1681,13 +1692,26 @@ struct UIKitMap: UIViewRepresentable {
                 }
                 return (data, reason)
             }
-            let isMediumZoom = requested.z >= 4 && requested.z <= 8
-            let allowGenericFallback = !isMediumZoom && requested.z <= 8
-            let allowStickyCompositeFallback = !isMediumZoom && requested.z <= 7
-            let allowStickyFallback = !isMediumZoom && requested.z <= 7
+            let previousFrameFallbackMaxAge: TimeInterval = 1.8
+            let allowGenericFallback = requested.z <= 8
+            let allowStickyCompositeFallback = requested.z <= 7
+            let allowStickyFallback = requested.z <= 7
             let resolveCachedFallback: () -> (Data, String)? = {
                 if let resolved = resolveVisibleRenderedCache(fallbackKey, "current-fallback") {
                     return resolved
+                }
+                if let fallbackTemplate,
+                   requested.z >= 4, requested.z <= 8,
+                   Date().timeIntervalSince1970 - self.stateQueue.sync(execute: { self.fallbackTemplateSetAt }) <= previousFrameFallbackMaxAge,
+                   sourceZ < requested.z
+                {
+                    let previousFrameKey = Self.tileCacheKey(
+                        template: fallbackTemplate,
+                        requested: requested
+                    )
+                    if let resolved = resolveVisibleRenderedCache(previousFrameKey, "previous-frame") {
+                        return resolved
+                    }
                 }
                 if allowGenericFallback,
                    let resolved = resolveVisibleRenderedCache(genericKey, "generic")
@@ -2207,6 +2231,13 @@ struct UIKitMap: UIViewRepresentable {
                         print("☁️ tile zero-visible: fallback \(reason)")
                     }
                     result(cached, nil)
+                    return
+                }
+                if let held = Self.renderedTileCache.object(forKey: specificKey as NSString) as Data? {
+                    if Self.shouldSample(requested) {
+                        print("☁️ tile zero-visible: hold-current")
+                    }
+                    result(held, nil)
                     return
                 }
                 if Self.shouldSample(requested) {
