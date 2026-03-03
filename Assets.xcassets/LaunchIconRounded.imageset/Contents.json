@@ -1,17 +1,17 @@
 {
   "images" : [
     {
-      "filename" : "test_tile.png",
+      "filename" : "LaunchIconRounded@1x.png",
       "idiom" : "universal",
       "scale" : "1x"
     },
     {
-      "filename" : "test_tile 1.png",
+      "filename" : "LaunchIconRounded@2x.png",
       "idiom" : "universal",
       "scale" : "2x"
     },
     {
-      "filename" : "test_tile 2.png",
+      "filename" : "LaunchIconRounded@3x.png",
       "idiom" : "universal",
       "scale" : "3x"
     }
